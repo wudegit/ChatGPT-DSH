@@ -1,0 +1,27 @@
+node_modules/
+docs/history-session/
+
+# Local developer configuration
+opencode.json
+cordis.patch.yml
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+dist/
+
+# Editor / OS metadata
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db

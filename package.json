@@ -1,0 +1,30 @@
+{
+  "name": "@chatgpt-dsh/mcp-bridge",
+  "private": true,
+  "version": "0.0.1",
+  "description": "ChatGPT-DSH P0: minimal MCP Tool Bridge over DeepSeek Harness ctx.tools",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wudegit/ChatGPT-DSH.git"
+  },
+  "homepage": "https://github.com/wudegit/ChatGPT-DSH#readme",
+  "bugs": {
+    "url": "https://github.com/wudegit/ChatGPT-DSH/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

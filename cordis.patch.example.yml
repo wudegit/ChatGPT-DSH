@@ -1,0 +1,26 @@
+# ChatGPT-DSH P0: MCP bridge verification overlay for `dsh web`.
+#
+# Copy this file to `cordis.patch.yml` and replace the plugin path below with
+# the absolute file:// URL of this repository's `src/index.ts`.
+#
+# Example (Windows):
+#   file:///C:/path/to/ChatGPT-DSH/src/index.ts
+# Example (Linux/macOS):
+#   file:///home/user/path/to/ChatGPT-DSH/src/index.ts
+#
+# Keep `cordis.patch.yml` local. It is intentionally ignored by Git.
+
+# Re-enable the harness read/write/edit tools for the P0 bridge.
+- id: tool-fs
+  disabled: false
+
+# Re-enable the harness file search tool (optional for P0).
+- id: tool-fs-search
+  disabled: false
+
+# Do not disable DSH-native observation, sandbox, or approval policies.
+
+# Insert the MCP bridge plugin (absolute file:// URL required).
+- insert:
+    - id: chatgpt-dsh-mcp-bridge
+      name: 'file:///ABSOLUTE/PATH/TO/ChatGPT-DSH/src/index.ts'
