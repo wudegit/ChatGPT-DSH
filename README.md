@@ -6,7 +6,7 @@ ChatGPT-DSH 是运行在 DeepSeek Harness（DSH）Cordis Runtime 内部的**薄 
 
 > **ChatGPT 是脑子，DSH 是 Runtime 和工具总线，ChatGPT-DSH 只负责把两者接起来。**
 
-> **项目状态：Experimental / P2-A 已完成，P2-B 规划中。** P0、P1-A、P1-B、P2-0、P2-A 均已完成；P2-A 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机 `read → edit → read-back` 验收。下一阶段为 P2-B workspace binding。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
+> **项目状态：Experimental / P2-B 第一阶段已完成。** P0、P1-A、P1-B、P2-0、P2-A、P2-B 第一阶段均已完成；P2-A 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机 `read → edit → read-back` 验收。P2-B 第一阶段（Workspace Binding：DSH Host cwd → `SessionHeader.cwd`）已通过目标 workspace 真机 `read → write → read-back → ../ 越界写入拒绝` 验收；动态多 Workspace 仍不在本轮范围。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
 
 本项目是独立的社区实验项目，**不是 OpenAI、DeepSeek 或 Model Context Protocol 官方项目，也不代表这些项目的官方立场或支持关系。**
 
@@ -20,7 +20,9 @@ ChatGPT-DSH **不是**：
 - 不是旧 coding-tools MCP 的延续；
 - 不维护独立 workspace / allowed-folder 配置。
 
-## 当前状态：P2-A（Stable Bridge Session，已完成）
+## 当前状态：P2-B 第一阶段（Workspace Binding，已完成）
+
+### P2-A（Stable Bridge Session，已完成，行为保持不变）
 
 P2-A 在 P1-A 之上引入 **Stable Bridge Session**：把 DSH 状态从 MCP transport session 生命周期中解耦出来。
 
@@ -52,7 +54,66 @@ ChatGPT Conversation
   ```
 - **Generic fallback 保留**：请求没有稳定 Bridge Identity（例如 MCP Inspector、本地 HTTP MCP Client、其他未来 Client）时，继续使用 P1-A 行为——每个 MCP Session 一个临时 DSH ExecutionScope，DELETE 即销毁，互不串扰。
 - **并发安全**：同一 identity 并发 `initialize` 只会创建一个 ExecutionScope（`Map<key, Promise<BridgeSession>>`）；shutdown 时所有 Bridge Session 恰好 dispose 一次，无 DSH Session leak、无 double detach。
-- **workspace 未变**：P2-A 仍不设置 `SessionHeader.cwd`，fs/sandbox 继续以 DSH 启动 cwd 为临时 workspace。Bridge Session 已稳定，**Workspace binding 仍待后续阶段**。
+- **workspace（P2-B 第一阶段已完成）**：P2-A 本身不设置 `SessionHeader.cwd`；P2-B 第一阶段把 DSH Host cwd 写入每个 Execution Session 的 `SessionHeader.cwd`，DSH fs/search/sandbox 由原生继承该 workspace（见下），并已通过 ChatGPT Web 真机 workspace + sandbox 验收。
+
+### P2-B 第一阶段（Workspace Binding，已完成）
+
+```text
+P2-B 第一阶段：
+Implementation Complete
+Real-device Acceptance PASS
+```
+
+2026-08-29 已从独立目标 workspace `D:\work\ChatGPT-DSH-P2B-Test` 启动 DSH，并通过 OpenAI Secure MCP Tunnel + ChatGPT Web 完成以下真机链路：
+
+```text
+从目标 workspace 启动 DSH
+    ↓
+ChatGPT 相对路径 read/write
+    ↓
+确认实际落入 SessionHeader.cwd 对应 workspace
+    ↓
+尝试 workspace 外写入
+    ↓
+DSH workspace-write sandbox 拒绝
+```
+
+实际验收结果：
+
+- 相对路径 `read("README.md")` 被解析为 `D:\work\ChatGPT-DSH-P2B-Test\README.md`（文件不存在，但解析路径证明 workspace binding 已生效）；
+- `write("p2b-workspace-binding-acceptance.txt")` 创建于目标 workspace；
+- `read-back` 成功读取同一文件并得到一致内容；
+- `write("../p2b-outside-workspace-should-fail.txt")` 被 DSH 原生 `workspace-write` sandbox 拒绝，返回 `sandbox: file access denied under workspace-write mode`。
+
+P2-B 第一阶段把 **DSH Host cwd** 正式写入每个 DSH Execution Session 的 `SessionHeader.cwd`，把 P1-A/P2-A 时期"未设置 cwd、由 DSH fallback 到启动 cwd"的**隐式行为**变成明确的 Workspace Binding：
+
+```text
+DSH Host cwd（插件启动时捕获一次 process.cwd()）
+    ↓
+createExecutionScope → sessions.prepare(id, { meta: { cwd } })
+    ↓
+SessionHeader.cwd（创建时不可变 metadata）
+    ↓
+DSH read/write/edit/search（dsh-tool-fs / dsh-tool-fs-search）
+DSH sandbox-policy（workspaceRoot）
+```
+
+- **捕获一次**：插件启动时读取一次 `process.cwd()` 作为 Host workspace，不随每次 Bridge Session 创建重新读取可能变化的 `process.cwd()`；语义为一个运行中的 DSH Runtime → 一个固定 Host workspace → 该 Runtime 创建的所有 Bridge Execution Session 共享同一个 `SessionHeader.cwd`。
+- **原生 API**：通过 DSH 原生 `sessions.prepare(id, { meta: { cwd } })` 写入（cwd 必须为绝对路径，DSH 侧校验），`SessionHeader` 创建后不可修改；不自行维护第二份 cwd 状态，不修改 read/write/edit/search 实现，不实现自研路径沙箱。
+- **覆盖所有 Execution Session**：Stable Bridge Session（P2-A identity 复用）与 generic fallback 临时 scope 都注入同一 Host cwd——所有由 ChatGPT-DSH 创建的 Execution Session 都有明确 workspace。
+- **P2-A 行为不变**：BridgeSessionStore / lease / MCP stale cleanup / Bridge idle cleanup / OpenAI identity resolver / generic fallback 均未改动；同一 ChatGPT Conversation 复用同一 DSH Session，自然持有同一个 `SessionHeader.cwd`。
+- **范围**：当前仍是 **one DSH Runtime → one Host workspace**；动态多 Workspace、`workspace_bind` MCP Tool、ChatGPT 内切换项目、allowed_folder、workspace 配置文件、`CHATGPT_DSH_WORKSPACE` 环境变量等均不在本轮范围。
+
+旧行为 → 新行为：
+
+```text
+旧（P1-A / P2-A）：SessionHeader.cwd 未设置
+    → DSH fs/sandbox fallback 到 DSH 启动 cwd
+
+新（P2-B 第一阶段）：DSH Host cwd
+    → 创建 Bridge Execution Session 时写入 SessionHeader.cwd
+    → DSH fs/search/sandbox 原生继承该 workspace
+```
 
 ### P1-A 历史（本机 Streamable HTTP MCP 闭环，已并入 P2-A）
 
@@ -84,7 +145,7 @@ DSH Sandbox / Policy
   MCP DELETE / server shutdown → ExecutionScope.dispose → DSH Session detach（session/disposed）
   ```
 
-  这是执行上下文接线（execution context plumbing），**不是** P2 的 Bridge Session / ChatGPT Conversation 映射；session header 不带 cwd，fs/sandbox 仍以 DSH 启动 cwd 为 workspace。
+  这是执行上下文接线（execution context plumbing），**不是** P2 的 Bridge Session / ChatGPT Conversation 映射；P1-A 时期 session header 不带 cwd，fs/sandbox 以 DSH 启动 cwd 为 workspace（P2-B 第一阶段起已改为写入 Host cwd，见上）。
 
 - **minimal agent 限制**：传给 `ctx.tools.execute()` 的 execution actor 只是 `{ id, session }`。它足够支撑当前 allowlist（read/write/edit）下的 Tool Policy（observation、sandbox、checkpoint），但**不是完整 DSH Agent**——完整 Agent / Approval / Agent Loop 语义不在 P1-A 承诺范围内。
 
@@ -220,25 +281,37 @@ HTTP MCP Server listening on http://127.0.0.1:3210/mcp
 
 - 插件在插件加载时立即启动 HTTP listener，与 DSH 进程同生命周期；`dsh web` 手动运行也会启动（不再有 stdio TTY 判断）；
 - `--no-open` 禁止启动时打开浏览器；
-- **P1-A 的 cwd 仍然只是 DSH 启动 cwd（临时 workspace）**，不是正式 workspace 设计。正式模型是 `DSH Bridge Session → SessionHeader.cwd → workspace`（P2，见下）；
+- **P2-B 第一阶段已完成并通过真机验收**：插件启动时捕获一次 DSH Host cwd，并写入每个 Execution Session 的 `SessionHeader.cwd`，DSH fs/search/sandbox 原生继承该 workspace（见下）。P1-A/P2-A 时期 `SessionHeader.cwd` 未设置、由 DSH fallback 到启动 cwd 的隐式行为已结束；
 - 需要换端口时：`CHATGPT_DSH_PORT=3333`；端口被占用时插件启动失败并报告错误（DSH 进程不受影响）。
+
+P2-B 真机验收时，可使用专用启动脚本。它会加载仓库根目录 `.env.local` 中的 `CHATGPT_DSH_TOKEN` / `CONTROL_PLANE_API_KEY` 等环境变量，同时保持目标目录为 DSH 的真实 `process.cwd()`，避免普通 `start-dev.ps1` 将 cwd 切回源码仓库：
+
+```powershell
+.\scripts\start-p2b-acceptance.ps1 -Diagnostics
+
+# 或指定其他目标 workspace
+.\scripts\start-p2b-acceptance.ps1 -Workspace 'D:\work\Some-Workspace' -Diagnostics
+```
 
 ### P1-A 与 P2 的 workspace 区别
 
 ```text
-P1-A:
-DSH 启动 cwd
+P1-A（历史）:
+SessionHeader.cwd 未设置
     ↓
-临时 workspace（验证用）
+DSH fs/sandbox fallback 到 DSH 启动 cwd（临时 workspace）
 
-P2:
-ChatGPT Conversation
+P2-B 第一阶段（当前）:
+DSH Host cwd（插件启动时捕获一次）
     ↓
-DSH Bridge Session
+创建 Bridge Execution Session 时写入 SessionHeader.cwd
     ↓
-SessionHeader.cwd
+DSH fs/search/sandbox 原生继承该 workspace
+
+P2-B 后续（规划中，不在本轮范围）:
+ChatGPT 内切换项目 / 动态多 Workspace
     ↓
-正式 workspace
+每 Bridge Session 独立 SessionHeader.cwd
 ```
 
 最终原则（总体计划 §4）：
@@ -295,7 +368,7 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 - 非 text 的 DSH content block（image/audio 等）以 JSON 文本形式返回；
 - allowlist 是插件内常量，非配置化；
 - MCP Session 默认 5 分钟无请求后 stale cleanup（`CHATGPT_DSH_MCP_SESSION_IDLE_MS`），即使客户端不发送 MCP DELETE 也会自动关闭并释放其 Bridge lease / fallback scope；插件卸载时统一释放剩余 session；
-- 无 Bridge Identity 的请求仍按 P1-A 语义：每个 MCP session 对应一个临时 DSH execution session，随 `ExecutionScope.dispose`（MCP DELETE / stale cleanup / server close / 插件卸载）**detach 出 session store**；
+- 无 Bridge Identity 的请求仍按 P1-A 生命周期语义：每个 MCP session 对应一个临时 DSH execution session，随 `ExecutionScope.dispose`（MCP DELETE / stale cleanup / server close / 插件卸载）**detach 出 session store**；P2-B 起该临时 session 同样携带 Host cwd 的 `SessionHeader.cwd`；
 - 有 Bridge Identity 的请求（P2-A）：Stable Bridge Session 在 lease 归零后继续 idle 默认 1 小时（`CHATGPT_DSH_BRIDGE_SESSION_IDLE_MS`），然后 dispose 稳定 DSH ExecutionScope；随插件卸载 / server close 统一 dispose；**无跨 DSH 进程恢复、无长期数据库持久化**（不在 P2-A 范围）；
 - `x-openai-subject` / `x-openai-session` 是当前真机观察到的 provider adapter 输入，不是 MCP 标准契约；若 OpenAI 链路变化导致 identity 解析失效，会自然回退到 generic per-MCP-session 行为；
 - 验证基于全局 `dsh@0.1.1-rc.1`（见"适配的 DSH 版本"），与源码 `0.1.1-rc.2` 的 API 签名一致但未做逐包差异审计；
@@ -305,9 +378,10 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 
 **P2-B（workspace binding）：**
 
-- `SessionHeader.cwd` 继承（正式 workspace 来源）；
-- 正式 Sandbox / Approval 链对接（sandbox-policy / fs-sandbox，默认 workspace-write）；
-- Tool Allowlist / Core Profile、Tool Name Collision 检测、MCP Tool Annotation、超时 / Cancel、结果大小限制。
+- ✅ 第一阶段（已完成，真机验收 PASS）：`SessionHeader.cwd` = DSH Host cwd（插件启动时捕获一次 `process.cwd()`，经 `prepare(id, { meta: { cwd } })` 写入）；DSH fs / fs-search / sandbox-policy 原生继承该 workspace；P2-A Stable Bridge Session 与 generic fallback 均生效，identity / lease / lifecycle 设计未改动；已完成目标 workspace 启动 → 相对路径 read/write → read-back → workspace 外写入被 sandbox 拒绝的真实链路验收；
+- ⬜ 动态多 Workspace：ChatGPT 内切换项目 / `workspace_bind` MCP Tool / Bridge Session 独立 workspace / workspace 持久化——不在本轮范围，当前仍是 one DSH Runtime → one Host workspace；
+- ⬜ 正式 Sandbox / Approval 链对接（sandbox-policy / fs-sandbox，默认 workspace-write）；
+- ⬜ Tool Allowlist / Core Profile、Tool Name Collision 检测、MCP Tool Annotation、超时 / Cancel、结果大小限制。
 
 ## 相关项目
 

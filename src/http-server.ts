@@ -23,9 +23,11 @@
  * entered through `ctx.sessions.prepare()` / `enter()` / `announce()`),
  * passed to `ctx.tools.execute()` as the agent.
  * This makes DSH-native tool policies (e.g. fs-observation-policy state
- * keyed by `agent.session`) work over the bridge while the session header
- * carries no cwd, so fs/sandbox keep the harness startup cwd as the
- * workspace — P1-A semantics unchanged.
+ * keyed by `agent.session`) work over the bridge. P2-B first phase
+ * (Workspace Binding): the scope factory writes the DSH Host cwd into
+ * `SessionHeader.cwd` at creation, so DSH fs / fs-search / sandbox-policy
+ * inherit the Host workspace natively instead of falling back to
+ * `process.cwd()` at use time.
  *
  * P2-A (Stable Bridge Session): when a request resolves a BridgeIdentity
  * (OpenAI adapter over `x-openai-subject` + `x-openai-session`, see
@@ -34,8 +36,9 @@
  * lease without disposing the stable DSH scope, so consecutive tool calls
  * of one ChatGPT Conversation (each with a fresh MCP session) keep the same
  * DSH session and observation state. Requests without an identity keep the
- * P1-A temporary-scope fallback. Workspace binding (SessionHeader.cwd) is
- * explicitly NOT part of P2-A.
+ * P1-A temporary-scope fallback; in P2-B that fallback also binds the same
+ * Host cwd, so every Execution Session created by this plugin carries an
+ * explicit workspace.
  *
  * @module
  */
