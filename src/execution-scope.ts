@@ -27,6 +27,9 @@ export interface DshSessionService {
   announce(session: { readonly id: string }): void
 }
 
+/** Diagnostics-only monotonic local scope id (P2-0 probe), e.g. `exec-1`. */
+let nextDiagnosticId = 1
+
 /**
  * Create one ExecutionScope owning a fresh temporary DSH session.
  *
@@ -44,8 +47,11 @@ export function createSessionExecutionScope(sessions: DshSessionService): Execut
     detach()
     throw error
   }
+  const diagnosticId = `exec-${nextDiagnosticId}`
+  nextDiagnosticId += 1
   return {
     agent: { id: session.id, session },
+    diagnosticId,
     dispose: () => {
       detach()
     },

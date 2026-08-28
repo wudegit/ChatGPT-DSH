@@ -6,7 +6,7 @@ ChatGPT-DSH 是运行在 DeepSeek Harness（DSH）Cordis Runtime 内部的**薄 
 
 > **ChatGPT 是脑子，DSH 是 Runtime 和工具总线，ChatGPT-DSH 只负责把两者接起来。**
 
-> **项目状态：Experimental / P1-A。** P0（stdio MCP Tool Bridge）已验证完成；P1-A 已将其升级为长期运行的**本机 Streamable HTTP MCP**（localhost + 最小 Bearer Token 认证）。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
+> **项目状态：Experimental / P2-A 规划中。** P0、P1-A 已完成；P1-B 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机验证；P2-0 Request Identity Probe 已完成，下一阶段为 Stable Bridge Session。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
 
 本项目是独立的社区实验项目，**不是 OpenAI、DeepSeek 或 Model Context Protocol 官方项目，也不代表这些项目的官方立场或支持关系。**
 
@@ -61,6 +61,17 @@ DSH Sandbox / Policy
 | `CHATGPT_DSH_TOKEN` | （必填，无默认） | Bearer Token；未配置则 MCP Server 不启动，控制台明确输出 `CHATGPT_DSH_TOKEN is required`（DSH 本身继续运行） |
 | `CHATGPT_DSH_HOST` | `127.0.0.1` | 监听地址；P1-A 只支持本机 |
 | `CHATGPT_DSH_PORT` | `3210` | 监听端口 |
+| `CHATGPT_DSH_DIAGNOSTIC_REQUESTS` | `off` | 实验性（P2-0）：`1` / `true` 开启每请求身份诊断日志；默认关闭，不改 session 语义，认证类 header 一律 redacted |
+
+### P2-0 实验性 Request Identity 诊断（仅观察）
+
+`CHATGPT_DSH_DIAGNOSTIC_REQUESTS=1` 开启每请求身份特征诊断日志（P2 identity investigation only）：
+
+- default off（未设置 / 空 / `0` / `false` 均关闭）
+- does not change session semantics（不改变 MCP / DSH session 生命周期）
+- redacts sensitive authentication headers（`Authorization` / `Cookie` / `x-api-key` 等名称统一输出为 `<redacted-header>`，值绝不输出）
+
+开启后每条 `/mcp` 请求输出一行 `[chatgpt-dsh][diag]` 前缀的 JSON 日志（timestamp / seq / HTTP method / path / Mcp-Session-Id / 可安全获得的 MCP method / session routing / header 名称列表 / identity 候选值），并输出 MCP Session 与 ExecutionScope 生命周期事件（`MCP_SESSION_CREATE` / `MCP_SESSION_INITIALIZED` / `MCP_SESSION_REUSE` / `MCP_SESSION_DELETE` / `MCP_SESSION_CLOSE` / `EXECUTION_SCOPE_CREATE` / `EXECUTION_SCOPE_DISPOSE`）。用于为 P2 Bridge Session 设计收集真实 ChatGPT Web 请求身份证据，**不**用于任何 session 映射。
 
 ## P0 历史（stdio，已由 P1-A 取代）
 
@@ -274,3 +285,7 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 ## License
 
 MIT. See `LICENSE`.
+
+## P2-0 真机结论
+
+P2-0 已确认 ChatGPT 的不同 Tool Call 不保证复用同一 MCP Session；当前真机中 `x-openai-session` 表现为 Conversation scoped identity，`x-openai-subject` 表现为 subject scoped identity。详细实验与 P2-A 设计约束见 `docs/p2-0-request-identity-probe.md`。

@@ -36,6 +36,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createToolsServer, type BridgeToolRuntime } from './tools-bridge.ts'
+import { classifyHeaders, formatDiagnosticLine, isDiagnosticsEnabled } from './diagnostics.ts'
 
 /** Default bind host; the bridge only serves localhost until P1-B. */
 export const DEFAULT_HOST = '127.0.0.1'
@@ -60,6 +61,8 @@ export interface ExecutionScope {
   readonly agent: { readonly id: string; readonly session: object }
   /** Release the scope; the owning MCP session disposes its DSH session here. */
   readonly dispose?: () => void | Promise<void>
+  /** Diagnostics-only local identifier (P2-0 probe); never used for routing. */
+  readonly diagnosticId?: string
 }
 
 /** Options for {@link startHttpMcpServer}. */
@@ -82,6 +85,12 @@ export interface HttpMcpServerOptions {
   readonly token?: string
   /** Log callback (defaults to console.log, matching the harness web app). */
   readonly log?: (message: string) => void
+  /**
+   * P2-0 request-identity diagnostics toggle; when omitted falls back to
+   * `CHATGPT_DSH_DIAGNOSTIC_REQUESTS`. Default off. Logging only — never
+   * changes MCP / DSH session semantics.
+   */
+  readonly diagnosticRequests?: boolean
 }
 
 /** The running HTTP MCP server handle. */
@@ -135,10 +144,18 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown | undefined> 
   }
 }
 
+/** The MCP method of a parsed JSON body; `null` when the body is not a JSON object. */
+function extractMethod(body: unknown): string | null {
+  if (typeof body === 'object' && body !== null) {
+    const method = (body as { method?: unknown }).method
+    if (typeof method === 'string') return method
+  }
+  return null
+}
+
 /** Whether the parsed JSON body is an MCP `initialize` request. */
 function isInitialize(body: unknown): boolean {
-  return typeof body === 'object' && body !== null
-    && (body as { method?: unknown }).method === 'initialize'
+  return extractMethod(body) === 'initialize'
 }
 
 /**
@@ -160,12 +177,29 @@ export async function startHttpMcpServer(
     throw new Error('CHATGPT_DSH_TOKEN is required')
   }
   const log = options.log ?? ((message: string): void => console.log(message))
+  const diagnostics = options.diagnosticRequests ?? isDiagnosticsEnabled()
+
+  // Diagnostics-only: one row per request / lifecycle event, prefixed for
+  // grep. Sensitive headers are redacted inside the diagnostics module.
+  let sequence = 0
+  const emitDiag = (fields: Record<string, unknown>): void => {
+    if (!diagnostics) return
+    log(formatDiagnosticLine({ timestamp: new Date().toISOString(), ...fields }))
+  }
+  const disposeScope = async (scope: ExecutionScope | undefined): Promise<void> => {
+    if (scope === undefined) return
+    emitDiag({ event: 'EXECUTION_SCOPE_DISPOSE', exec: scope.diagnosticId ?? null })
+    await scope.dispose?.()
+  }
 
   // MCP transport session id → session pair. One SDK transport per session.
   const sessions = new Map<string, McpSession>()
 
   async function createSession(): Promise<McpSession> {
     const executionScope = options.createExecutionScope?.()
+    if (executionScope !== undefined) {
+      emitDiag({ event: 'EXECUTION_SCOPE_CREATE', exec: executionScope.diagnosticId ?? null })
+    }
     const core = createToolsServer(options.tools, {
       ...options.allow === undefined ? {} : { allow: options.allow },
       ...executionScope === undefined ? {} : { agent: executionScope.agent },
@@ -175,7 +209,7 @@ export async function startHttpMcpServer(
     const closeOnce = (): Promise<void> => {
       closePromise ??= (async () => {
         try {
-          await executionScope?.dispose?.()
+          await disposeScope(executionScope)
         } finally {
           try {
             await transport.close()
@@ -194,9 +228,11 @@ export async function startHttpMcpServer(
       onsessioninitialized: (sessionId) => {
         session.registered = true
         sessions.set(sessionId, session)
+        emitDiag({ event: 'MCP_SESSION_INITIALIZED', mcpSessionId: sessionId, exec: executionScope?.diagnosticId ?? null })
       },
       // SDK calls this when the client DELETE-terminates the session.
       onsessionclosed: (sessionId) => {
+        emitDiag({ event: 'MCP_SESSION_DELETE', mcpSessionId: sessionId, exec: executionScope?.diagnosticId ?? null })
         void closeSession(sessionId)
       },
     })
@@ -206,6 +242,7 @@ export async function startHttpMcpServer(
       registered: false,
       close: closeOnce,
     }
+    emitDiag({ event: 'MCP_SESSION_CREATE', mcpSessionId: null, exec: executionScope?.diagnosticId ?? null })
     // The SDK's onclose getter includes `| undefined` while the Transport
     // interface omits it (exactOptionalPropertyTypes mismatch); the cast
     // records only that widening. Same pattern as DSH's own mcp-client.
@@ -215,7 +252,7 @@ export async function startHttpMcpServer(
       // The scope was created but the protocol server failed to attach; the
       // session is not registered, so release the scope (DSH session detach)
       // and the core here rather than leaking them.
-      await executionScope?.dispose?.()
+      await disposeScope(executionScope)
       await core.dispose()
       throw error
     }
@@ -226,6 +263,7 @@ export async function startHttpMcpServer(
     const session = sessions.get(sessionId)
     if (session === undefined) return
     sessions.delete(sessionId)
+    emitDiag({ event: 'MCP_SESSION_CLOSE', mcpSessionId: sessionId, exec: session.executionScope?.diagnosticId ?? null })
     await session.close()
   }
 
@@ -237,15 +275,59 @@ export async function startHttpMcpServer(
    * - no session id + POST initialize → create session
    * - no session id + anything else → 400 (never create)
    */
-  async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function handleMcpRequest(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
     const header = req.headers['mcp-session-id']
     const sessionId = typeof header === 'string' && header !== '' ? header : undefined
+
+    // Diagnostics-only work runs only when enabled; the default-off path
+    // must not classify headers, build request fields, or bump the seq.
+    const diag = diagnostics
+      ? {
+          base: {
+            event: 'request',
+            seq: ++sequence,
+            method: req.method,
+            path: pathname,
+            hasMcpSessionId: sessionId !== undefined,
+            mcpSessionId: sessionId ?? null,
+          },
+          headers: classifyHeaders(req.headers),
+        }
+      : null
 
     if (sessionId !== undefined) {
       const session = sessions.get(sessionId)
       if (session === undefined) {
+        if (diag !== null) {
+          emitDiag({
+            ...diag.base,
+            mcpMethod: null,
+            isInitialize: false,
+            createdSession: false,
+            matchedSession: false,
+            exec: null,
+            ...diag.headers,
+          })
+        }
         sendJson(res, 404, { error: 'unknown session' })
         return
+      }
+      // The request body is owned by StreamableHTTPServerTransport here, so
+      // the MCP method is not read out — diagnostics must not consume the
+      // body stream of an established session.
+      if (diag !== null) {
+        emitDiag({
+          ...diag.base,
+          mcpMethod: null,
+          isInitialize: false,
+          createdSession: false,
+          matchedSession: true,
+          exec: session.executionScope?.diagnosticId ?? null,
+          ...diag.headers,
+        })
+        if (req.method !== 'DELETE') {
+          emitDiag({ event: 'MCP_SESSION_REUSE', mcpSessionId: sessionId, exec: session.executionScope?.diagnosticId ?? null })
+        }
       }
       try {
         await session.transport.handleRequest(req, res)
@@ -259,11 +341,33 @@ export async function startHttpMcpServer(
     }
 
     if (req.method !== 'POST') {
+      if (diag !== null) {
+        emitDiag({
+          ...diag.base,
+          mcpMethod: null,
+          isInitialize: false,
+          createdSession: false,
+          matchedSession: false,
+          exec: null,
+          ...diag.headers,
+        })
+      }
       sendJson(res, 400, { error: 'missing session' })
       return
     }
     const body = await readJsonBody(req)
     if (!isInitialize(body)) {
+      if (diag !== null) {
+        emitDiag({
+          ...diag.base,
+          mcpMethod: extractMethod(body),
+          isInitialize: false,
+          createdSession: false,
+          matchedSession: false,
+          exec: null,
+          ...diag.headers,
+        })
+      }
       sendJson(res, 400, { error: 'missing session' })
       return
     }
@@ -276,10 +380,32 @@ export async function startHttpMcpServer(
       // ExecutionScope creation (e.g. DSH announce failure) or protocol
       // attach failed; report without taking the listener down.
       log(`[chatgpt-dsh] session creation failed: ${String(error)}`)
+      if (diag !== null) {
+        emitDiag({
+          ...diag.base,
+          mcpMethod: 'initialize',
+          isInitialize: true,
+          createdSession: false,
+          matchedSession: false,
+          exec: null,
+          ...diag.headers,
+        })
+      }
       if (!res.headersSent) {
         sendJson(res, 500, { error: 'mcp transport error' })
       }
       return
+    }
+    if (diag !== null) {
+      emitDiag({
+        ...diag.base,
+        mcpMethod: 'initialize',
+        isInitialize: true,
+        createdSession: true,
+        matchedSession: false,
+        exec: session.executionScope?.diagnosticId ?? null,
+        ...diag.headers,
+      })
     }
     try {
       await session.transport.handleRequest(req, res, body)
@@ -320,7 +446,7 @@ export async function startHttpMcpServer(
       return
     }
 
-    await handleMcpRequest(req, res)
+    await handleMcpRequest(req, res, pathname)
   })
 
   await new Promise<void>((resolve, reject) => {
@@ -345,7 +471,8 @@ export async function startHttpMcpServer(
     url,
     port: boundPort,
     async close() {
-      for (const session of [...sessions.values()]) {
+      for (const [sessionId, session] of [...sessions.entries()]) {
+        emitDiag({ event: 'MCP_SESSION_CLOSE', mcpSessionId: sessionId, exec: session.executionScope?.diagnosticId ?? null })
         await session.close()
       }
       sessions.clear()

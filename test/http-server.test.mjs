@@ -11,10 +11,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { request as httpRequest } from 'node:http'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { startHttpMcpServer } from '../src/http-server.ts'
 import { createSessionExecutionScope } from '../src/execution-scope.ts'
+import { classifyHeaders, isDiagnosticsEnabled } from '../src/diagnostics.ts'
 
 const TOKEN = 'test-secret'
 
@@ -267,4 +269,285 @@ test('close releases the port', async (t) => {
   const base = server.url.replace(/\/mcp$/, '')
   await server.close()
   await assert.rejects(fetch(`${base}/health`), /fetch failed|ECONNREFUSED/i)
+})
+
+const DIAG_PREFIX = '[chatgpt-dsh][diag]'
+const DIAG_ENV = 'CHATGPT_DSH_DIAGNOSTIC_REQUESTS'
+
+function saveEnv(name) {
+  const had = Object.prototype.hasOwnProperty.call(process.env, name)
+  const value = process.env[name]
+  return () => {
+    if (had) process.env[name] = value
+    else delete process.env[name]
+  }
+}
+
+function diagLines(lines) {
+  return lines.filter((l) => l.startsWith(DIAG_PREFIX))
+}
+
+/** Raw HTTP POST over node:http so forbidden fetch headers (e.g. Cookie) can be sent. */
+function rawPost(port, headers, body) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      path: '/mcp',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+    }, (res) => {
+      res.resume()
+      res.on('end', () => resolve(res.statusCode))
+    })
+    req.on('error', reject)
+    req.end(JSON.stringify(body))
+  })
+}
+
+test('diagnostics: env flag semantics', () => {
+  assert.equal(isDiagnosticsEnabled({}), false)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: '' }), false)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: '0' }), false)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: 'false' }), false)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: '2' }), false)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: '1' }), true)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: 'true' }), true)
+  assert.equal(isDiagnosticsEnabled({ [DIAG_ENV]: 'TRUE' }), true)
+})
+
+test('diagnostics: classifyHeaders redacts sensitive names and values', () => {
+  const { headerNames, identity } = classifyHeaders({
+    authorization: 'Bearer super-secret-test-token',
+    cookie: 'session=secret',
+    'x-api-key': 'leaked-api-key',
+    'user-agent': 'probe/1.0',
+    'x-request-id': 'rid-123',
+    traceparent: '00-abc-01',
+    'x-openai-request-id': 'openai-rid',
+    'x-openai-api-key': 'must-not-leak',
+  })
+  assert.ok(headerNames.includes('<redacted-header>'), 'sensitive names collapsed')
+  assert.ok(headerNames.includes('user-agent'), 'innocuous names kept')
+  assert.ok(!headerNames.some((n) => /authorization|cookie|api[-_]?key/i.test(n)), 'no sensitive names listed')
+  assert.equal(identity['x-request-id'], 'rid-123')
+  assert.equal(identity.traceparent, '00-abc-01')
+  assert.equal(identity['x-openai-request-id'], 'openai-rid')
+  assert.ok(!('authorization' in identity), 'authorization value never logged')
+  assert.ok(!('cookie' in identity), 'cookie value never logged')
+  assert.ok(!('x-api-key' in identity), 'x-api-key value never logged')
+  assert.ok(!('x-openai-api-key' in identity), 'x-openai-api-key value never logged')
+})
+
+test('diagnostics: off path skips classify / request diagnostics work', async (t) => {
+  const restoreEnv = saveEnv(DIAG_ENV)
+  delete process.env[DIAG_ENV]
+  t.after(restoreEnv)
+
+  const { tools, executeCalls } = mockTools()
+  const fake = fakeSessions()
+  const lines = []
+  const server = await startHttpMcpServer({
+    tools,
+    token: TOKEN,
+    port: 0,
+    allow: ['read'],
+    createExecutionScope: () => createSessionExecutionScope(fake.service),
+    log: (m) => lines.push(m),
+  })
+  const base = server.url.replace(/\/mcp$/, '')
+  const port = Number(new URL(server.url).port)
+  t.after(async () => { await server.close() })
+
+  // The default-off path must not classify headers, build request
+  // diagnostics fields, or bump the diagnostics seq — enforced by the
+  // `diag = diagnostics ? ... : null` short-circuit in handleMcpRequest.
+  // Observable behavior: the full request lifecycle works exactly as with
+  // diagnostics enabled, and no `[chatgpt-dsh][diag]` line is ever emitted.
+  const auth = { Authorization: `Bearer ${TOKEN}`, 'X-Request-Id': 'rid-off' }
+  const init = await rpc(`${base}/mcp`, initialize(), auth)
+  assert.equal(init.status, 200)
+  assert.equal(init.json?.result?.serverInfo?.name, 'chatgpt-dsh-mcp-bridge')
+  const sid = init.headers.get('mcp-session-id')
+  assert.ok(sid)
+
+  const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
+  assert.equal(list.status, 200)
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read'])
+
+  const call = await rpc(`${base}/mcp`, {
+    jsonrpc: '2.0', id: 3, method: 'tools/call',
+    params: { name: 'read', arguments: { file_path: 'README.md', limit: 5 } },
+  }, { ...auth, 'Mcp-Session-Id': sid })
+  assert.equal(call.status, 200)
+  assert.equal(executeCalls.length, 1)
+  assert.deepEqual(executeCalls[0].arguments, { file_path: 'README.md', limit: 5 }, 'request body intact')
+
+  const rawStatus = await rawPost(port, {
+    Authorization: `Bearer ${TOKEN}`,
+    Cookie: 'session=secret',
+    'X-Api-Key': 'leaked-api-key',
+  }, toolsList())
+  assert.equal(rawStatus, 400, 'tools/list without session id → missing session')
+
+  const del = await fetch(`${base}/mcp`, { method: 'DELETE', headers: { ...auth, 'Mcp-Session-Id': sid } })
+  assert.ok(del.status === 200 || del.status === 204, `DELETE accepted (${del.status})`)
+  assert.equal(fake.live.size, 0, 'DSH session detached after MCP DELETE')
+  assert.equal(fake.history.detached.length, 1)
+
+  assert.equal(diagLines(lines).length, 0, 'no diagnostic rows when disabled')
+})
+
+test('diagnostics: enabled via env; request + lifecycle rows, secrets redacted', async (t) => {
+  const restoreEnv = saveEnv(DIAG_ENV)
+  process.env[DIAG_ENV] = '1'
+  t.after(restoreEnv)
+
+  const { tools, executeCalls } = mockTools()
+  const fake = fakeSessions()
+  const lines = []
+  const server = await startHttpMcpServer({
+    tools,
+    token: TOKEN,
+    port: 0,
+    allow: ['read'],
+    createExecutionScope: () => createSessionExecutionScope(fake.service),
+    log: (m) => lines.push(m),
+  })
+  const base = server.url.replace(/\/mcp$/, '')
+  const port = Number(new URL(server.url).port)
+  t.after(async () => { await server.close() })
+
+  const auth = { Authorization: `Bearer ${TOKEN}`, 'X-Request-Id': 'rid-1' }
+  const init = await rpc(`${base}/mcp`, initialize(), auth)
+  assert.equal(init.status, 200)
+  const sid = init.headers.get('mcp-session-id')
+  assert.ok(sid, 'initialize returns Mcp-Session-Id')
+
+  const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
+  assert.equal(list.status, 200)
+
+  const call = await rpc(`${base}/mcp`, {
+    jsonrpc: '2.0', id: 3, method: 'tools/call',
+    params: { name: 'read', arguments: { file_path: 'README.md', limit: 5 } },
+  }, { ...auth, 'Mcp-Session-Id': sid })
+  assert.equal(call.status, 200)
+  assert.equal(executeCalls.length, 1)
+  assert.deepEqual(executeCalls[0].arguments, { file_path: 'README.md', limit: 5 }, 'request body reaches tools.execute intact')
+
+  // Raw request with forbidden-fetch headers so the redaction path is hit.
+  const rawStatus = await rawPost(port, {
+    Authorization: `Bearer ${TOKEN}`,
+    Cookie: 'session=secret',
+    'X-Api-Key': 'leaked-api-key',
+  }, toolsList())
+  assert.equal(rawStatus, 400, 'tools/list without session id → missing session')
+
+  const del = await fetch(`${base}/mcp`, { method: 'DELETE', headers: { ...auth, 'Mcp-Session-Id': sid } })
+  assert.ok(del.status === 200 || del.status === 204, `DELETE accepted (${del.status})`)
+  assert.equal(fake.live.size, 0, 'DSH session detached after MCP DELETE')
+
+  const all = lines.join('\n')
+  assert.ok(!all.includes('test-secret'), 'Bearer token value never logged')
+  assert.ok(!all.includes('session=secret'), 'Cookie value never logged')
+  assert.ok(!all.includes('leaked-api-key'), 'X-Api-Key value never logged')
+
+  const rows = diagLines(lines).map((l) => JSON.parse(l.slice(DIAG_PREFIX.length)))
+  const requests = rows.filter((r) => r.event === 'request')
+  assert.equal(requests.length, 5, 'one request row per HTTP request')
+  const [initRow, listRow, callRow, rawRow, delRow] = requests
+
+  assert.equal(initRow.seq, 1)
+  assert.equal(initRow.method, 'POST')
+  assert.equal(initRow.path, '/mcp')
+  assert.equal(initRow.hasMcpSessionId, false)
+  assert.equal(initRow.mcpSessionId, null)
+  assert.equal(initRow.mcpMethod, 'initialize')
+  assert.equal(initRow.isInitialize, true)
+  assert.equal(initRow.createdSession, true)
+  assert.equal(initRow.matchedSession, false)
+  assert.equal(initRow.identity['x-request-id'], 'rid-1')
+  assert.ok(initRow.headerNames.includes('<redacted-header>'), 'sensitive header names collapsed')
+  assert.ok(!initRow.headerNames.some((n) => /authorization|cookie|api[-_]?key/i.test(n)), 'no sensitive header names listed')
+
+  assert.equal(listRow.seq, 2)
+  assert.equal(listRow.hasMcpSessionId, true)
+  assert.equal(listRow.mcpSessionId, sid)
+  assert.equal(listRow.matchedSession, true)
+  assert.equal(listRow.createdSession, false)
+  assert.equal(listRow.mcpMethod, null, 'mcpMethod not read from an established session body')
+
+  assert.equal(callRow.mcpSessionId, sid)
+  assert.equal(callRow.matchedSession, true)
+
+  assert.equal(rawRow.seq, 4)
+  assert.equal(rawRow.mcpMethod, 'tools/list')
+  assert.equal(rawRow.createdSession, false)
+  assert.ok(!('authorization' in rawRow.identity))
+  assert.ok(!('cookie' in rawRow.identity))
+  assert.ok(!('x-api-key' in rawRow.identity))
+
+  assert.equal(delRow.method, 'DELETE')
+  assert.equal(delRow.matchedSession, true)
+
+  const events = rows.filter((r) => r.event !== 'request')
+  const eventNames = events.map((r) => r.event)
+  for (const event of ['EXECUTION_SCOPE_CREATE', 'MCP_SESSION_CREATE', 'MCP_SESSION_INITIALIZED', 'MCP_SESSION_REUSE', 'MCP_SESSION_DELETE', 'MCP_SESSION_CLOSE', 'EXECUTION_SCOPE_DISPOSE']) {
+    assert.ok(eventNames.includes(event), `lifecycle event ${event} observed`)
+  }
+  assert.equal(events.filter((r) => r.event === 'MCP_SESSION_REUSE').length, 2, 'reuse logged for list + call, not DELETE')
+
+  const scopeCreate = events.find((r) => r.event === 'EXECUTION_SCOPE_CREATE')
+  assert.match(scopeCreate.exec, /^exec-\d+$/)
+  assert.equal(events.find((r) => r.event === 'MCP_SESSION_INITIALIZED').exec, scopeCreate.exec, 'session lifecycle shares the scope exec id')
+  assert.equal(initRow.exec, scopeCreate.exec, 'request rows carry the same exec id')
+  assert.equal(events.find((r) => r.event === 'EXECUTION_SCOPE_DISPOSE').exec, scopeCreate.exec)
+  assert.equal(events.find((r) => r.event === 'MCP_SESSION_CLOSE').mcpSessionId, sid)
+  assert.equal(events.find((r) => r.event === 'MCP_SESSION_DELETE').mcpSessionId, sid)
+})
+
+test('diagnostics: enabled via option; MCP behavior unchanged', async (t) => {
+  const { tools, executeCalls } = mockTools()
+  const fake = fakeSessions()
+  const lines = []
+  const server = await startHttpMcpServer({
+    tools,
+    token: TOKEN,
+    port: 0,
+    allow: ['read'],
+    createExecutionScope: () => createSessionExecutionScope(fake.service),
+    diagnosticRequests: true,
+    log: (m) => lines.push(m),
+  })
+  const base = server.url.replace(/\/mcp$/, '')
+  t.after(async () => { await server.close() })
+
+  const auth = { Authorization: `Bearer ${TOKEN}` }
+  const init = await rpc(`${base}/mcp`, initialize(), auth)
+  assert.equal(init.status, 200)
+  assert.equal(init.json?.result?.serverInfo?.name, 'chatgpt-dsh-mcp-bridge')
+  const sid = init.headers.get('mcp-session-id')
+
+  const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
+  assert.equal(list.status, 200)
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read'])
+
+  const call = await rpc(`${base}/mcp`, {
+    jsonrpc: '2.0', id: 3, method: 'tools/call',
+    params: { name: 'read', arguments: { file_path: 'README.md' } },
+  }, { ...auth, 'Mcp-Session-Id': sid })
+  assert.equal(call.status, 200)
+  assert.equal(call.json?.result?.content?.[0]?.text, 'ok:read')
+  assert.equal(executeCalls.length, 1)
+  assert.deepEqual(executeCalls[0].arguments, { file_path: 'README.md' }, 'body intact for established sessions')
+
+  const del = await fetch(`${base}/mcp`, { method: 'DELETE', headers: { ...auth, 'Mcp-Session-Id': sid } })
+  assert.ok(del.status === 200 || del.status === 204, `DELETE accepted (${del.status})`)
+  assert.equal(fake.live.size, 0, 'DSH session detached after MCP DELETE')
+  assert.equal(fake.history.detached.length, 1)
+
+  const rows = diagLines(lines).map((l) => JSON.parse(l.slice(DIAG_PREFIX.length)))
+  assert.ok(rows.some((r) => r.event === 'request' && r.createdSession === true), 'initialize row logged')
+  assert.ok(rows.some((r) => r.event === 'MCP_SESSION_INITIALIZED'), 'initialized event logged')
+  assert.ok(rows.some((r) => r.event === 'EXECUTION_SCOPE_DISPOSE'), 'dispose event logged')
 })
