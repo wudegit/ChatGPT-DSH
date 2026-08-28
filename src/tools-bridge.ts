@@ -1,16 +1,19 @@
 /**
- * P0: minimal MCP Tool Bridge over the DeepSeek Harness tool registry.
+ * ChatGPT-DSH MCP Server Core — DSH Tool Adapter + MCP protocol handlers.
  *
- * Exposes an allowlisted subset of `ctx.tools.schemas()` as MCP tools over a
- * stdio transport, and forwards `tools/call` to `ctx.tools.execute()`.
- * The harness tool registry is the source of truth; this module is only an
- * adapter. No tool implementation is redefined here.
+ * Exposes an allowlisted subset of `ctx.tools.schemas()` as MCP tools and
+ * forwards `tools/call` to `ctx.tools.execute()`. The harness tool registry
+ * is the source of truth; this module is only an adapter. No tool
+ * implementation is redefined here.
+ *
+ * This module is transport-agnostic: it creates the MCP `Server` and the
+ * tools/list + tools/call handlers, and the caller connects whichever
+ * transport it wants (stdio in P0, Streamable HTTP since P1-A).
  *
  * @module
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import type {
   CallToolRequest,
   CallToolResult,
@@ -18,12 +21,21 @@ import type {
 } from '@modelcontextprotocol/sdk/types.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
+/** Bridge version, reported as the MCP server version. Keep in sync with package.json. */
+export const BRIDGE_VERSION = '0.1.0'
+
 /** Minimal structural view of one DSH tool schema (from `ctx.tools.schemas()`). */
 export interface BridgeToolSchema {
   readonly name: string
   readonly description: string
   /** Standard JSON Schema object (`type: 'object'` + `properties` + `required`). */
   readonly parameters: Record<string, unknown>
+}
+
+/** Minimal structural view of the DSH `Agent` as `ctx.tools.execute()` consumes it. */
+export interface BridgeAgent {
+  readonly id: string
+  readonly session: object
 }
 
 /** Minimal structural view of a DSH tool content block. */
@@ -59,15 +71,29 @@ export interface BridgeToolRuntime {
     readonly name: string
     readonly arguments: unknown
     readonly signal: AbortSignal
+    /** Optional agent scope; carries the DSH session used by tool policies. */
+    readonly agent?: BridgeAgent
   }): Promise<BridgeExecutionResult>
 }
 
-/** Bridge options. */
-export interface ToolsBridgeOptions {
+/** Options for the MCP server core. */
+export interface ToolsServerOptions {
   /** Tool names exposed over MCP; the default allowlist is empty (expose nothing). */
   readonly allow?: readonly string[]
-  /** Invoked when the stdio transport closes (client disconnected or stdin EOF). */
-  readonly onClose?: () => void
+  /**
+   * The agent scope for every call handled by this server instance (the DSH
+   * execution scope of the owning MCP session). Omitted = agentless calls
+   * (P0 behavior; fs-observation-policy state is not recorded).
+   */
+  readonly agent?: BridgeAgent
+}
+
+/** The created MCP server core plus its disposer. */
+export interface ToolsServer {
+  /** The MCP protocol server; the caller connects a transport. */
+  readonly server: Server
+  /** Close the protocol server (independent of any transport). */
+  readonly dispose: () => Promise<void>
 }
 
 /** MCP tool definition projected from a DSH tool schema. */
@@ -99,52 +125,20 @@ function valueToText(value: unknown): string {
 }
 
 /**
- * Route the harness logger output away from stdout so the MCP frame stays clean.
- *
- * P0 STDIO-ONLY workaround: MCP stdio transport 要求 stdout 只承载协议帧，
- * 而 DSH logger 默认写 stdout；把 console.log/info/warn/debug 重定向到 stderr
- * 是 stdio 协议保护措施。P1 切换 Streamable HTTP Transport 后应删除，
- * 不要把它发展成长期 Logging Infrastructure。
- */
-function redirectConsoleToStderr(): () => void {
-  const original = {
-    log: console.log,
-    info: console.info,
-    warn: console.warn,
-    debug: console.debug,
-  }
-  const writeStderr = (...args: unknown[]): void => {
-    process.stderr.write(args.map(String).join(' ') + '\n')
-  }
-  console.log = writeStderr
-  console.info = writeStderr
-  console.warn = writeStderr
-  console.debug = writeStderr
-  return () => {
-    console.log = original.log
-    console.info = original.info
-    console.warn = original.warn
-    console.debug = original.debug
-  }
-}
-
-/**
- * Start the MCP bridge: create the server, register handlers, connect the
- * stdio transport, and keep stdout reserved for the MCP protocol.
+ * Create the MCP server core over the harness tool runtime.
  *
  * @param tools - the harness tool runtime (`ctx.tools`).
- * @param options - allowlist and lifecycle hooks.
- * @returns a disposer that closes the server and transport and restores stdout.
+ * @param options - allowlist.
+ * @returns the protocol server (transport not yet connected) and its disposer.
  */
-export async function startToolsBridge(
+export function createToolsServer(
   tools: BridgeToolRuntime,
-  options: ToolsBridgeOptions = {},
-): Promise<() => Promise<void>> {
+  options: ToolsServerOptions = {},
+): ToolsServer {
   const allow = new Set(options.allow ?? [])
-  const restoreConsole = redirectConsoleToStderr()
 
   const server = new Server(
-    { name: 'chatgpt-dsh-mcp-bridge', version: '0.0.1' },
+    { name: 'chatgpt-dsh-mcp-bridge', version: BRIDGE_VERSION },
     { capabilities: { tools: {} } },
   )
 
@@ -177,6 +171,7 @@ export async function startToolsBridge(
           name,
           arguments: args ?? {},
           signal: controller.signal,
+          ...options.agent === undefined ? {} : { agent: options.agent },
         })
         if (result.isError) {
           return {
@@ -202,22 +197,14 @@ export async function startToolsBridge(
     },
   )
 
-  const transport = new StdioServerTransport()
-  transport.onclose = () => options.onClose?.()
-  await server.connect(transport)
-
-  return async () => {
-    transport.onclose = () => {}
-    try {
-      await server.close()
-    } catch {
-      // Already closed.
-    }
-    try {
-      await transport.close()
-    } catch {
-      // Already closed.
-    }
-    restoreConsole()
+  return {
+    server,
+    async dispose() {
+      try {
+        await server.close()
+      } catch {
+        // Already closed.
+      }
+    },
   }
 }

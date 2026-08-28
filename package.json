@@ -1,8 +1,8 @@
 {
   "name": "@chatgpt-dsh/mcp-bridge",
   "private": true,
-  "version": "0.0.1",
-  "description": "ChatGPT-DSH P0: minimal MCP Tool Bridge over DeepSeek Harness ctx.tools",
+  "version": "0.1.0",
+  "description": "ChatGPT MCP bridge over DeepSeek Harness tools",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,10 +14,11 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/http-server.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0"
