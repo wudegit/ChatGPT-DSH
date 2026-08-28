@@ -25,8 +25,17 @@
  * This makes DSH-native tool policies (e.g. fs-observation-policy state
  * keyed by `agent.session`) work over the bridge while the session header
  * carries no cwd, so fs/sandbox keep the harness startup cwd as the
- * workspace — P1-A semantics unchanged. This is execution-context plumbing,
- * NOT the P2 Bridge Session (no ChatGPT conversation mapping).
+ * workspace — P1-A semantics unchanged.
+ *
+ * P2-A (Stable Bridge Session): when a request resolves a BridgeIdentity
+ * (OpenAI adapter over `x-openai-subject` + `x-openai-session`, see
+ * request-identity.ts), the MCP session acquires a stable BridgeSession
+ * instead of creating its own temporary scope. MCP DELETE releases the
+ * lease without disposing the stable DSH scope, so consecutive tool calls
+ * of one ChatGPT Conversation (each with a fresh MCP session) keep the same
+ * DSH session and observation state. Requests without an identity keep the
+ * P1-A temporary-scope fallback. Workspace binding (SessionHeader.cwd) is
+ * explicitly NOT part of P2-A.
  *
  * @module
  */
@@ -37,6 +46,18 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { createToolsServer, type BridgeToolRuntime } from './tools-bridge.ts'
 import { classifyHeaders, formatDiagnosticLine, isDiagnosticsEnabled } from './diagnostics.ts'
+import {
+  createBridgeSessionStore,
+  parseBridgeSessionIdleMs,
+  parseMcpSessionIdleMs,
+  type BridgeSession,
+  type BridgeSessionStore,
+} from './bridge-session.ts'
+import {
+  createOpenAiIdentityResolver,
+  type BridgeIdentity,
+  type RequestIdentityResolver,
+} from './request-identity.ts'
 
 /** Default bind host; the bridge only serves localhost until P1-B. */
 export const DEFAULT_HOST = '127.0.0.1'
@@ -91,6 +112,29 @@ export interface HttpMcpServerOptions {
    * changes MCP / DSH session semantics.
    */
   readonly diagnosticRequests?: boolean
+  /**
+   * Resolves a stable BridgeIdentity from request headers (P2-A). Defaults
+   * to the OpenAI adapter (`x-openai-subject` + `x-openai-session`).
+   * Requests without an identity keep the P1-A temporary-scope fallback.
+   */
+  readonly requestIdentityResolver?: RequestIdentityResolver
+  /**
+   * Bridge session idle timeout in ms. Defaults to
+   * `CHATGPT_DSH_BRIDGE_SESSION_IDLE_MS` or 3600000. Invalid values fall
+   * back to the default and never break startup.
+   */
+  readonly bridgeSessionIdleMs?: number
+  /** Bridge session cleanup sweep interval in ms (defaults to min(idleMs/2, 5min)). */
+  readonly bridgeSessionCleanupIntervalMs?: number
+  /**
+   * MCP transport session idle timeout in ms. Defaults to
+   * `CHATGPT_DSH_MCP_SESSION_IDLE_MS` or 300000. Stale MCP sessions are
+   * closed (releasing bridge leases / disposing fallback scopes) even when
+   * the client never sends DELETE. Invalid values fall back to the default.
+   */
+  readonly mcpSessionIdleMs?: number
+  /** Stale MCP session sweep interval in ms (defaults to min(idleMs/2, 60s)). */
+  readonly mcpSessionCleanupIntervalMs?: number
 }
 
 /** The running HTTP MCP server handle. */
@@ -109,9 +153,15 @@ interface McpSession {
   readonly transport: StreamableHTTPServerTransport
   /** The DSH execution scope backing this session, when one was configured. */
   readonly executionScope: ExecutionScope | undefined
+  /** The stable bridge session backing this session, when identity-based. */
+  readonly bridgeSession: BridgeSession | undefined
+  /** Whether this MCP session created (vs reused) its bridge session. */
+  readonly bridgeSessionCreated: boolean
+  /** Last routed /mcp request timestamp (ms); stale sweep input. */
+  lastUsedAt: number
   /** Whether the client's initialize completed (session id registered). */
   registered: boolean
-  /** Close transport, protocol core, and scope. Idempotent. */
+  /** Close transport, protocol core, and release scope ownership. Idempotent. */
   readonly close: () => Promise<void>
 }
 
@@ -195,10 +245,42 @@ export async function startHttpMcpServer(
   // MCP transport session id → session pair. One SDK transport per session.
   const sessions = new Map<string, McpSession>()
 
-  async function createSession(): Promise<McpSession> {
-    const executionScope = options.createExecutionScope?.()
-    if (executionScope !== undefined) {
-      emitDiag({ event: 'EXECUTION_SCOPE_CREATE', exec: executionScope.diagnosticId ?? null })
+  // P2-A: stable bridge sessions keyed by resolved request identity. The
+  // store exists only when an execution scope factory is configured; without
+  // one, every request keeps the P0 agentless behavior.
+  const identityResolver = options.requestIdentityResolver ?? createOpenAiIdentityResolver()
+  const bridgeIdleMs = options.bridgeSessionIdleMs
+    ?? parseBridgeSessionIdleMs(process.env.CHATGPT_DSH_BRIDGE_SESSION_IDLE_MS)
+  const mcpIdleMs = options.mcpSessionIdleMs
+    ?? parseMcpSessionIdleMs(process.env.CHATGPT_DSH_MCP_SESSION_IDLE_MS)
+  const createScope = options.createExecutionScope
+  const bridgeStore: BridgeSessionStore | undefined = createScope !== undefined
+    ? createBridgeSessionStore({
+        createScope,
+        idleMs: bridgeIdleMs,
+        cleanupIntervalMs: options.bridgeSessionCleanupIntervalMs
+          ?? Math.min(Math.floor(bridgeIdleMs / 2), 300_000),
+        log,
+      })
+    : undefined
+
+  async function createSession(identity: BridgeIdentity | undefined): Promise<McpSession> {
+    let executionScope: ExecutionScope | undefined
+    let bridgeSession: BridgeSession | undefined
+    let bridgeSessionCreated = false
+    if (identity !== undefined && bridgeStore !== undefined) {
+      // Stable path: the bridge store owns the scope; this MCP session only
+      // holds a lease. MCP DELETE must NOT dispose it.
+      const acquired = await bridgeStore.acquire(identity)
+      bridgeSession = acquired.session
+      bridgeSessionCreated = acquired.created
+      executionScope = acquired.session.executionScope
+    } else {
+      // Generic fallback: this MCP session owns a temporary scope (P1-A).
+      executionScope = options.createExecutionScope?.()
+      if (executionScope !== undefined) {
+        emitDiag({ event: 'EXECUTION_SCOPE_CREATE', exec: executionScope.diagnosticId ?? null })
+      }
     }
     const core = createToolsServer(options.tools, {
       ...options.allow === undefined ? {} : { allow: options.allow },
@@ -206,10 +288,19 @@ export async function startHttpMcpServer(
     })
     let session: McpSession
     let closePromise: Promise<void> | undefined
+    // Release scope ownership on close: bridge → release lease; fallback →
+    // dispose own scope. Never dispose a stable scope from an MCP session.
+    const releaseOwnership = (): void | Promise<void> => {
+      if (bridgeSession !== undefined && bridgeStore !== undefined) {
+        bridgeStore.release(bridgeSession)
+        return
+      }
+      return disposeScope(executionScope)
+    }
     const closeOnce = (): Promise<void> => {
       closePromise ??= (async () => {
         try {
-          await disposeScope(executionScope)
+          await releaseOwnership()
         } finally {
           try {
             await transport.close()
@@ -239,20 +330,31 @@ export async function startHttpMcpServer(
     session = {
       transport,
       executionScope,
+      bridgeSession,
+      bridgeSessionCreated,
+      lastUsedAt: Date.now(),
       registered: false,
       close: closeOnce,
     }
-    emitDiag({ event: 'MCP_SESSION_CREATE', mcpSessionId: null, exec: executionScope?.diagnosticId ?? null })
+    emitDiag({
+      event: 'MCP_SESSION_CREATE',
+      mcpSessionId: null,
+      exec: executionScope?.diagnosticId ?? null,
+      ...bridgeSession === undefined ? {} : {
+        bridgeSession: bridgeSession.diagnosticId,
+        bridgeSessionCreated,
+      },
+    })
     // The SDK's onclose getter includes `| undefined` while the Transport
     // interface omits it (exactOptionalPropertyTypes mismatch); the cast
     // records only that widening. Same pattern as DSH's own mcp-client.
     try {
       await core.server.connect(transport as unknown as Transport)
     } catch (error) {
-      // The scope was created but the protocol server failed to attach; the
-      // session is not registered, so release the scope (DSH session detach)
+      // The scope (or lease) was acquired but the protocol server failed to
+      // attach; the session is not registered, so release the lease / scope
       // and the core here rather than leaking them.
-      await disposeScope(executionScope)
+      await releaseOwnership()
       await core.dispose()
       throw error
     }
@@ -266,6 +368,23 @@ export async function startHttpMcpServer(
     emitDiag({ event: 'MCP_SESSION_CLOSE', mcpSessionId: sessionId, exec: session.executionScope?.diagnosticId ?? null })
     await session.close()
   }
+
+  // Stale MCP session sweep: ChatGPT does not reliably send MCP DELETE, so
+  // sessions idle past mcpIdleMs are closed here (releasing bridge leases or
+  // disposing fallback scopes through the same ownership path as DELETE).
+  // `closeSession` removes the Map entry synchronously, so a request racing
+  // with the sweep simply sees an unknown session (404). close() is
+  // idempotent, so DELETE / sweep / shutdown never double-close.
+  let mcpCleanupTimer: ReturnType<typeof setInterval> | undefined
+  mcpCleanupTimer = setInterval(() => {
+    const cutoff = Date.now() - mcpIdleMs
+    for (const [sessionId, session] of [...sessions.entries()]) {
+      if (session.lastUsedAt <= cutoff) {
+        void closeSession(sessionId)
+      }
+    }
+  }, options.mcpSessionCleanupIntervalMs ?? Math.min(Math.floor(mcpIdleMs / 2), 60_000))
+  mcpCleanupTimer.unref()
 
   /**
    * Route one authenticated request to its MCP session.
@@ -312,6 +431,12 @@ export async function startHttpMcpServer(
         sendJson(res, 404, { error: 'unknown session' })
         return
       }
+      // Every routed request refreshes the MCP session's lastUsedAt and the
+      // backing bridge session's timestamp so neither is idle-reclaimed.
+      session.lastUsedAt = Date.now()
+      if (bridgeStore !== undefined && session.bridgeSession !== undefined) {
+        bridgeStore.touch(session.bridgeSession)
+      }
       // The request body is owned by StreamableHTTPServerTransport here, so
       // the MCP method is not read out — diagnostics must not consume the
       // body stream of an established session.
@@ -323,6 +448,7 @@ export async function startHttpMcpServer(
           createdSession: false,
           matchedSession: true,
           exec: session.executionScope?.diagnosticId ?? null,
+          bridgeSession: session.bridgeSession?.diagnosticId ?? null,
           ...diag.headers,
         })
         if (req.method !== 'DELETE') {
@@ -373,9 +499,10 @@ export async function startHttpMcpServer(
     }
 
     // Legitimate session creation: initialize without a session id.
+    const identity = identityResolver.resolve(req.headers)
     let session: McpSession
     try {
-      session = await createSession()
+      session = await createSession(identity)
     } catch (error) {
       // ExecutionScope creation (e.g. DSH announce failure) or protocol
       // attach failed; report without taking the listener down.
@@ -388,6 +515,9 @@ export async function startHttpMcpServer(
           createdSession: false,
           matchedSession: false,
           exec: null,
+          bridgeIdentityResolved: identity !== undefined,
+          bridgeSession: null,
+          bridgeSessionCreated: false,
           ...diag.headers,
         })
       }
@@ -404,6 +534,9 @@ export async function startHttpMcpServer(
         createdSession: true,
         matchedSession: false,
         exec: session.executionScope?.diagnosticId ?? null,
+        bridgeIdentityResolved: identity !== undefined,
+        bridgeSession: session.bridgeSession?.diagnosticId ?? null,
+        bridgeSessionCreated: session.bridgeSessionCreated,
         ...diag.headers,
       })
     }
@@ -471,11 +604,20 @@ export async function startHttpMcpServer(
     url,
     port: boundPort,
     async close() {
+      // Stop both cleanup timers first so no sweep races the teardown.
+      if (mcpCleanupTimer !== undefined) {
+        clearInterval(mcpCleanupTimer)
+        mcpCleanupTimer = undefined
+      }
+      bridgeStore?.stopCleanup()
       for (const [sessionId, session] of [...sessions.entries()]) {
         emitDiag({ event: 'MCP_SESSION_CLOSE', mcpSessionId: sessionId, exec: session.executionScope?.diagnosticId ?? null })
         await session.close()
       }
       sessions.clear()
+      // Shutdown: dispose every stable bridge session exactly once (no DSH
+      // session leak, no double detach).
+      await bridgeStore?.disposeAll()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
   }

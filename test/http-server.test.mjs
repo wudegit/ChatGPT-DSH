@@ -325,6 +325,8 @@ test('diagnostics: classifyHeaders redacts sensitive names and values', () => {
     'x-request-id': 'rid-123',
     traceparent: '00-abc-01',
     'x-openai-request-id': 'openai-rid',
+    'x-openai-session': 'stable-session-value',
+    'x-openai-subject': 'stable-subject-value',
     'x-openai-api-key': 'must-not-leak',
   })
   assert.ok(headerNames.includes('<redacted-header>'), 'sensitive names collapsed')
@@ -333,6 +335,11 @@ test('diagnostics: classifyHeaders redacts sensitive names and values', () => {
   assert.equal(identity['x-request-id'], 'rid-123')
   assert.equal(identity.traceparent, '00-abc-01')
   assert.equal(identity['x-openai-request-id'], 'openai-rid')
+  assert.match(identity['x-openai-session'], /^sha256:[0-9a-f]{16}$/)
+  assert.match(identity['x-openai-subject'], /^sha256:[0-9a-f]{16}$/)
+  assert.notEqual(identity['x-openai-session'], 'stable-session-value', 'stable session id is fingerprinted')
+  assert.notEqual(identity['x-openai-subject'], 'stable-subject-value', 'stable subject id is fingerprinted')
+  assert.notEqual(identity['x-openai-session'], identity['x-openai-subject'], 'different raw ids keep distinct fingerprints')
   assert.ok(!('authorization' in identity), 'authorization value never logged')
   assert.ok(!('cookie' in identity), 'cookie value never logged')
   assert.ok(!('x-api-key' in identity), 'x-api-key value never logged')

@@ -6,7 +6,7 @@ ChatGPT-DSH 是运行在 DeepSeek Harness（DSH）Cordis Runtime 内部的**薄 
 
 > **ChatGPT 是脑子，DSH 是 Runtime 和工具总线，ChatGPT-DSH 只负责把两者接起来。**
 
-> **项目状态：Experimental / P2-A 规划中。** P0、P1-A 已完成；P1-B 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机验证；P2-0 Request Identity Probe 已完成，下一阶段为 Stable Bridge Session。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
+> **项目状态：Experimental / P2-A 已完成，P2-B 规划中。** P0、P1-A、P1-B、P2-0、P2-A 均已完成；P2-A 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机 `read → edit → read-back` 验收。下一阶段为 P2-B workspace binding。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
 
 本项目是独立的社区实验项目，**不是 OpenAI、DeepSeek 或 Model Context Protocol 官方项目，也不代表这些项目的官方立场或支持关系。**
 
@@ -20,7 +20,41 @@ ChatGPT-DSH **不是**：
 - 不是旧 coding-tools MCP 的延续；
 - 不维护独立 workspace / allowed-folder 配置。
 
-## 当前状态：P1-A（已完成）
+## 当前状态：P2-A（Stable Bridge Session，已完成）
+
+P2-A 在 P1-A 之上引入 **Stable Bridge Session**：把 DSH 状态从 MCP transport session 生命周期中解耦出来。
+
+```text
+ChatGPT Conversation
+        │
+        ├─ MCP Session A
+        ├─ MCP Session B
+        └─ MCP Session C
+                │
+                ▼
+        Stable Bridge Session（BridgeSessionStore）
+                │
+                ▼
+        Stable DSH ExecutionScope
+                │
+                ▼
+        Stable DSH Session
+```
+
+- **Identity 来源**：当前 Secure MCP Tunnel 真机观察到 `x-openai-subject` + `x-openai-session` 两个 header。两者都存在且非空时，解析为 opaque BridgeIdentity（`sha256(subject \0 session)`），**这是 provider adapter 的实现细节，不是 MCP 标准契约**；核心 Bridge Session 层只持有 opaque identity，不依赖具体 header 名称。
+- **会话复用**：同一 ChatGPT Conversation 的多次 Tool Call 即使每次都创建新 MCP Session（真机已确认），也会命中同一个 Bridge Session / DSH ExecutionScope，因此 `read → edit` 的 observation 状态可以跨 MCP Session 延续。**P2-A 真机验收已通过**：`read → edit → read-back` 三次 Connector 调用使用了三个不同 MCP Session，但均命中同一 Bridge Session / ExecutionScope，`edit` 成功且未再触发 `edit requires reading first`。
+- **解耦语义**：MCP DELETE 只释放 Bridge Session lease，**不** dispose 稳定 scope；Bridge Session 通过 lease + idle timeout 管理生命周期（默认 1 小时无 lease 后清理）。MCP Session 生命周期 ≠ Bridge Session 生命周期。
+- **两层 idle 生命周期**：ChatGPT 真机**不保证发送 MCP DELETE**，因此 MCP Session 自带 stale cleanup（默认 5 分钟无请求即关闭，释放 Bridge lease / 销毁 fallback scope），Bridge Session 再按自身 idle（默认 1 小时）回收稳定 DSH scope。即使客户端从不 DELETE，也不会永久泄漏：
+
+  ```text
+  MCP idle（默认 5 min）→ 关闭 stale MCP Session → Bridge lease -1
+  Bridge idle（默认 1 h）→ lease=0 且超时 → dispose 稳定 DSH ExecutionScope
+  ```
+- **Generic fallback 保留**：请求没有稳定 Bridge Identity（例如 MCP Inspector、本地 HTTP MCP Client、其他未来 Client）时，继续使用 P1-A 行为——每个 MCP Session 一个临时 DSH ExecutionScope，DELETE 即销毁，互不串扰。
+- **并发安全**：同一 identity 并发 `initialize` 只会创建一个 ExecutionScope（`Map<key, Promise<BridgeSession>>`）；shutdown 时所有 Bridge Session 恰好 dispose 一次，无 DSH Session leak、无 double detach。
+- **workspace 未变**：P2-A 仍不设置 `SessionHeader.cwd`，fs/sandbox 继续以 DSH 启动 cwd 为临时 workspace。Bridge Session 已稳定，**Workspace binding 仍待后续阶段**。
+
+### P1-A 历史（本机 Streamable HTTP MCP 闭环，已并入 P2-A）
 
 P1-A 实现**本机 Streamable HTTP MCP 闭环**：
 
@@ -62,6 +96,8 @@ DSH Sandbox / Policy
 | `CHATGPT_DSH_HOST` | `127.0.0.1` | 监听地址；P1-A 只支持本机 |
 | `CHATGPT_DSH_PORT` | `3210` | 监听端口 |
 | `CHATGPT_DSH_DIAGNOSTIC_REQUESTS` | `off` | 实验性（P2-0）：`1` / `true` 开启每请求身份诊断日志；默认关闭，不改 session 语义，认证类 header 一律 redacted |
+| `CHATGPT_DSH_MCP_SESSION_IDLE_MS` | `300000` | MCP transport/protocol session 空闲超时（毫秒）；ChatGPT 不保证发送 MCP DELETE，超时后主动关闭 stale MCP Session 并释放其 Bridge lease / fallback scope；非正整数回退默认值 |
+| `CHATGPT_DSH_BRIDGE_SESSION_IDLE_MS` | `3600000` | P2-A：Bridge Session（稳定 DSH ExecutionScope）无活跃 lease 的空闲超时（毫秒）；非正整数自动回退默认值，不影响启动 |
 
 ### P2-0 实验性 Request Identity 诊断（仅观察）
 
@@ -70,8 +106,9 @@ DSH Sandbox / Policy
 - default off（未设置 / 空 / `0` / `false` 均关闭）
 - does not change session semantics（不改变 MCP / DSH session 生命周期）
 - redacts sensitive authentication headers（`Authorization` / `Cookie` / `x-api-key` 等名称统一输出为 `<redacted-header>`，值绝不输出）
+- fingerprints stable upstream pseudonymous ids：`x-openai-session` / `x-openai-subject` 只输出 `sha256:<16 hex>` 短指纹，保留跨请求相等性比较能力，但不记录原始值
 
-开启后每条 `/mcp` 请求输出一行 `[chatgpt-dsh][diag]` 前缀的 JSON 日志（timestamp / seq / HTTP method / path / Mcp-Session-Id / 可安全获得的 MCP method / session routing / header 名称列表 / identity 候选值），并输出 MCP Session 与 ExecutionScope 生命周期事件（`MCP_SESSION_CREATE` / `MCP_SESSION_INITIALIZED` / `MCP_SESSION_REUSE` / `MCP_SESSION_DELETE` / `MCP_SESSION_CLOSE` / `EXECUTION_SCOPE_CREATE` / `EXECUTION_SCOPE_DISPOSE`）。用于为 P2 Bridge Session 设计收集真实 ChatGPT Web 请求身份证据，**不**用于任何 session 映射。
+开启后每条 `/mcp` 请求输出一行 `[chatgpt-dsh][diag]` 前缀的 JSON 日志（timestamp / seq / HTTP method / path / Mcp-Session-Id / 可安全获得的 MCP method / session routing / header 名称列表 / identity 候选值），并输出 MCP Session 与 ExecutionScope 生命周期事件（`MCP_SESSION_CREATE` / `MCP_SESSION_INITIALIZED` / `MCP_SESSION_REUSE` / `MCP_SESSION_DELETE` / `MCP_SESSION_CLOSE` / `EXECUTION_SCOPE_CREATE` / `EXECUTION_SCOPE_DISPOSE`）。该诊断能力用于调查和验收；Bridge Session 路由由独立的 `RequestIdentityResolver` 负责，不依赖 diagnostics 输出。
 
 ## P0 历史（stdio，已由 P1-A 取代）
 
@@ -252,27 +289,22 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 - **DSH ToolSchema → MCP Tool**：`name` / `description` 直接透传；`parameters` 已是标准 JSON Schema（`{type: 'object', properties, required}`），直接作为 MCP `inputSchema`，无字段重命名。
 - **DSH Tool Result → MCP CallToolResult**：成功时优先使用 DSH 已渲染的 `content`（text block），无内容时回退 `JSON.stringify(value)`；失败时返回 `{content: [{type: 'text', text: error.message}], isError: true}`。
 
-## 已知限制（P1-A 实测）
+## 已知限制（P1-A / P2-A 实测）
 
 - 每次 `tools/call` 使用独立的 `AbortController`，无超时策略、无 AbortSignal 传播、无审批桥接（按要求不实现）；
 - 非 text 的 DSH content block（image/audio 等）以 JSON 文本形式返回；
 - allowlist 是插件内常量，非配置化；
-- MCP session 无空闲超时清理（客户端不发 DELETE 时 session 驻留内存）；插件卸载时统一释放；
-- 每个 MCP session 对应一个临时 DSH execution session（`prepare → enter → announce`），随 `ExecutionScope.dispose`（MCP DELETE / server close / 插件卸载）**detach 出 session store**，不跨 MCP session 保留；P1-A 不做 ChatGPT Conversation → DSH Session 映射（P2）；
+- MCP Session 默认 5 分钟无请求后 stale cleanup（`CHATGPT_DSH_MCP_SESSION_IDLE_MS`），即使客户端不发送 MCP DELETE 也会自动关闭并释放其 Bridge lease / fallback scope；插件卸载时统一释放剩余 session；
+- 无 Bridge Identity 的请求仍按 P1-A 语义：每个 MCP session 对应一个临时 DSH execution session，随 `ExecutionScope.dispose`（MCP DELETE / stale cleanup / server close / 插件卸载）**detach 出 session store**；
+- 有 Bridge Identity 的请求（P2-A）：Stable Bridge Session 在 lease 归零后继续 idle 默认 1 小时（`CHATGPT_DSH_BRIDGE_SESSION_IDLE_MS`），然后 dispose 稳定 DSH ExecutionScope；随插件卸载 / server close 统一 dispose；**无跨 DSH 进程恢复、无长期数据库持久化**（不在 P2-A 范围）；
+- `x-openai-subject` / `x-openai-session` 是当前真机观察到的 provider adapter 输入，不是 MCP 标准契约；若 OpenAI 链路变化导致 identity 解析失效，会自然回退到 generic per-MCP-session 行为；
 - 验证基于全局 `dsh@0.1.1-rc.1`（见"适配的 DSH 版本"），与源码 `0.1.1-rc.2` 的 API 签名一致但未做逐包差异审计；
 - Bearer Token 为 P1-A 本机最小认证技术验证；公网场景（P1-B）需要重新评估认证方案（TLS、OAuth 或反代层认证）。
 
-## P1-B / P2 前需要解决的问题（不实现，仅记录）
+## 后续阶段需要解决的问题（不实现，仅记录）
 
-**P1-B：**
+**P2-B（workspace binding）：**
 
-- 公网 HTTPS / Tunnel（FRP / Cloudflare 等由部署者管理，插件不管理）；
-- ChatGPT 网页真机接入（MCP over 公网）；
-- 认证方案升级评估（当前 Bearer Token 仅限本机）。
-
-**P2：**
-
-- Bridge Session（ChatGPT Conversation → DSH Bridge Session 映射）；
 - `SessionHeader.cwd` 继承（正式 workspace 来源）；
 - 正式 Sandbox / Approval 链对接（sandbox-policy / fs-sandbox，默认 workspace-write）；
 - Tool Allowlist / Core Profile、Tool Name Collision 检测、MCP Tool Annotation、超时 / Cancel、结果大小限制。

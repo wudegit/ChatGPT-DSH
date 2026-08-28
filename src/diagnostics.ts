@@ -4,12 +4,14 @@
  *
  * Purpose: observe real ChatGPT Web MCP request / session identity features
  * without changing session semantics and without leaking authentication
- * headers. Default off (`CHATGPT_DSH_DIAGNOSTIC_REQUESTS`). This is an
- * observation probe only — nothing here is used for session mapping.
+ * headers. Stable upstream pseudonymous ids (currently x-openai-session /
+ * x-openai-subject) are logged only as short SHA-256 fingerprints. Default off
+ * (`CHATGPT_DSH_DIAGNOSTIC_REQUESTS`). Diagnostics are not used for routing.
  *
  * @module
  */
 
+import { createHash } from 'node:crypto'
 import type { IncomingHttpHeaders } from 'node:http'
 
 /** Stable line prefix for every diagnostics line; grep-able. */
@@ -56,6 +58,18 @@ function isIdentityCandidate(lowerName: string): boolean {
     || lowerName.startsWith('openai-')
 }
 
+/** Stable pseudonymous upstream ids must remain comparable without logging raw values. */
+const FINGERPRINTED_IDENTITY_HEADERS: ReadonlySet<string> = new Set([
+  'x-openai-session',
+  'x-openai-subject',
+])
+
+function diagnosticIdentityValue(lowerName: string, value: string): string {
+  if (!FINGERPRINTED_IDENTITY_HEADERS.has(lowerName)) return value
+  const fingerprint = createHash('sha256').update(value).digest('hex').slice(0, 16)
+  return `sha256:${fingerprint}`
+}
+
 /**
  * Whether request diagnostics are enabled.
  *
@@ -94,7 +108,8 @@ export function classifyHeaders(headers: IncomingHttpHeaders): HeaderClassificat
     }
     headerNames.push(name)
     if (isIdentityCandidate(lower)) {
-      identity[name] = typeof value === 'string' ? value : value.join(',')
+      const rawValue = typeof value === 'string' ? value : value.join(',')
+      identity[name] = diagnosticIdentityValue(lower, rawValue)
     }
   }
   return { headerNames, identity }
