@@ -31,11 +31,23 @@ function mockTools() {
   return {
     tools: {
       schemas() {
-        return [{
-          name: 'read',
-          description: 'read a file',
-          parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
-        }]
+        return [
+          {
+            name: 'read',
+            description: 'read a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
+          },
+          {
+            name: 'write',
+            description: 'write a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] },
+          },
+          {
+            name: 'edit',
+            description: 'edit a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] },
+          },
+        ]
       },
       async execute(input) {
         executeCalls.push(input)
@@ -173,7 +185,6 @@ test('bridge: same identity reuses one stable scope across MCP sessions', async 
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -203,7 +214,7 @@ test('bridge: different conversations never share state', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -228,7 +239,7 @@ test('bridge: different subjects never share state', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -253,7 +264,7 @@ test('bridge: generic fallback keeps P1-A per-MCP-session isolation', async (t) 
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -287,7 +298,7 @@ test('bridge: a single identity header falls back to generic behavior', async (t
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -322,7 +333,7 @@ test('bridge: observation continuity — read then edit across MCP sessions', as
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read', 'edit'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -364,7 +375,7 @@ test('bridge: MCP DELETE does not dispose the stable scope', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -393,7 +404,7 @@ test('bridge: idle cleanup disposes unused bridge sessions', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -422,7 +433,7 @@ test('bridge: active lease prevents idle cleanup', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -447,7 +458,7 @@ test('bridge: server close disposes every stable scope exactly once', async (t) 
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -474,7 +485,7 @@ test('bridge: concurrent getOrCreate creates a single scope', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -498,7 +509,7 @@ test('bridge: scope creation failure leaves no store entry', async (t) => {
   const scopes = countingScopes(fake)
   fake.service.announce = () => { throw new Error('listener vetoed') }
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -523,7 +534,7 @@ test('bridge: failed initialize does not leak a lease', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     ...FAST_IDLE,
   })
@@ -586,7 +597,7 @@ test('bridge: diagnostics report bridge identity fields without raw values', asy
   const scopes = countingScopes(fake)
   const lines = []
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     diagnosticRequests: true,
     log: (m) => lines.push(m),
@@ -663,7 +674,7 @@ test('mcp stale cleanup without DELETE: leases drain, bridge scope reclaimed', a
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     // MCP sessions go stale fast; bridge idle is long enough to observe the
     // two-stage lifecycle (lease drain → bridge dispose).
@@ -711,7 +722,7 @@ test('mcp stale cleanup: active requests keep the session and lease alive', asyn
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     mcpSessionIdleMs: 120,
     mcpSessionCleanupIntervalMs: 5,
@@ -746,7 +757,7 @@ test('mcp stale cleanup: generic fallback scope disposed without DELETE', async 
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     mcpSessionIdleMs: 30,
     mcpSessionCleanupIntervalMs: 5,
@@ -776,7 +787,7 @@ test('shutdown after stale cleanup never double disposes', async (t) => {
   const fake = fakeSessions()
   const scopes = countingScopes(fake)
   const server = await startHttpMcpServer({
-    tools, token: TOKEN, port: 0, allow: ['read'],
+    tools, token: TOKEN, port: 0,
     createExecutionScope: scopes.create,
     mcpSessionIdleMs: 30,
     mcpSessionCleanupIntervalMs: 5,

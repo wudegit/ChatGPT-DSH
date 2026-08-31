@@ -36,9 +36,6 @@ export const name = 'chatgpt-dsh-mcp-bridge'
 /** Services required before the bridge starts. */
 export const inject = ['tools', 'sessions']
 
-/** P0/P1-A test allowlist: read / write / edit from the harness filesystem tools. */
-const ALLOWED_TOOLS: readonly string[] = ['read', 'write', 'edit']
-
 export function apply(ctx: Context): void {
   const tools = (ctx as unknown as { tools: BridgeToolRuntime }).tools
   const sessions = (ctx as unknown as { sessions: DshSessionService }).sessions
@@ -65,7 +62,6 @@ export function apply(ctx: Context): void {
   ctx.effect(async () => {
     const options: HttpMcpServerOptions = {
       tools,
-      allow: ALLOWED_TOOLS,
       // One temporary DSH execution session per MCP session, owned by the
       // ExecutionScope (prepare → enter → announce; dispose detaches).
       // fs-observation-policy keys its state on `agent.session`; P2-B writes
@@ -73,13 +69,23 @@ export function apply(ctx: Context): void {
       // fs/sandbox inherit it natively (no fallback to process.cwd()).
       createExecutionScope: () => createSessionExecutionScope(sessions, { cwd: workspaceCwd }),
     }
-    const http = await startHttpMcpServer(options)
-    // startHttpMcpServer logs the endpoint via console.log (like dsh-web-app's
-    // URL print) so it is visible even when logger levels hide [I] rows.
-    ctx.logger.info(`${name}: HTTP MCP Server listening on ${http.url}`)
-    return async () => {
-      await http.close()
-      ctx.logger.info(`${name}: HTTP MCP Server closed`)
+    try {
+      const http = await startHttpMcpServer(options)
+      // startHttpMcpServer logs the endpoint via console.log (like dsh-web-app's
+      // URL print) so it is visible even when logger levels hide [I] rows.
+      ctx.logger.info(`${name}: HTTP MCP Server listening on ${http.url}`)
+      return async () => {
+        await http.close()
+        ctx.logger.info(`${name}: HTTP MCP Server closed`)
+      }
+    } catch (error) {
+      // Bridge startup failures (including registry contract violations) are
+      // isolated to this plugin. DSH Web remains available and no half-started
+      // MCP listener is retained.
+      const message = `${name}: HTTP MCP Server not started: ${String(error)}`
+      ctx.logger.error(message)
+      console.error(message)
+      return () => {}
     }
   })
 }

@@ -29,11 +29,23 @@ function mockTools() {
   return {
     tools: {
       schemas() {
-        return [{
-          name: 'read',
-          description: 'read a file',
-          parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
-        }]
+        return [
+          {
+            name: 'read',
+            description: 'read a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
+          },
+          {
+            name: 'write',
+            description: 'write a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] },
+          },
+          {
+            name: 'edit',
+            description: 'edit a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] },
+          },
+        ]
       },
       async execute(input) {
         return { isError: false, value: 'ok', content: [{ type: 'text', text: `ok:${input.name}` }] }
@@ -149,7 +161,6 @@ test('P2-B: stable bridge session keeps one scope and one cwd across MCP session
     tools: mockTools().tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: recorder.create,
   })
   t.after(async () => { await server.close() })
@@ -175,7 +186,6 @@ test('P2-B: different bridge sessions keep distinct identity but the same cwd', 
     tools: mockTools().tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: recorder.create,
   })
   t.after(async () => { await server.close() })
@@ -202,7 +212,6 @@ test('P2-B: generic fallback keeps per-MCP-session isolation and binds the same 
     tools: mockTools().tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: recorder.create,
   })
   t.after(async () => { await server.close() })

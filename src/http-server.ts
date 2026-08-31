@@ -61,6 +61,7 @@ import {
   type BridgeIdentity,
   type RequestIdentityResolver,
 } from './request-identity.ts'
+import { resolveCoreToolProfile } from './tool-profile.ts'
 
 /** Default bind host; the bridge only serves localhost until P1-B. */
 export const DEFAULT_HOST = '127.0.0.1'
@@ -93,8 +94,6 @@ export interface ExecutionScope {
 export interface HttpMcpServerOptions {
   /** The harness tool runtime (`ctx.tools`). */
   readonly tools: BridgeToolRuntime
-  /** Tool names exposed over MCP. */
-  readonly allow?: readonly string[]
   /**
    * Creates the DSH execution scope for each new MCP session. When omitted,
    * calls run without an agent (P0 behavior: observation state is not
@@ -217,7 +216,7 @@ function isInitialize(body: unknown): boolean {
  * Fails (throws) instead of starting without authentication when
  * `CHATGPT_DSH_TOKEN` is not configured.
  *
- * @param options - tools runtime, allowlist, and optional env overrides.
+ * @param options - tools runtime and optional transport/lifecycle overrides.
  * @returns the endpoint URL, bound port, and a close disposer.
  */
 export async function startHttpMcpServer(
@@ -229,6 +228,10 @@ export async function startHttpMcpServer(
   if (token === undefined || token === '') {
     throw new Error('CHATGPT_DSH_TOKEN is required')
   }
+  // Resolve the static Core Tool Profile before creating timers, sessions, or
+  // the HTTP listener. Missing required tools and any registry name collision
+  // therefore fail closed without leaving a partial MCP service running.
+  const toolProfile = resolveCoreToolProfile(options.tools.schemas())
   const log = options.log ?? ((message: string): void => console.log(message))
   const diagnostics = options.diagnosticRequests ?? isDiagnosticsEnabled()
 
@@ -286,7 +289,7 @@ export async function startHttpMcpServer(
       }
     }
     const core = createToolsServer(options.tools, {
-      ...options.allow === undefined ? {} : { allow: options.allow },
+      profile: toolProfile,
       ...executionScope === undefined ? {} : { agent: executionScope.agent },
     })
     let session: McpSession

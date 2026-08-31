@@ -26,11 +26,23 @@ function mockTools() {
   return {
     tools: {
       schemas() {
-        return [{
-          name: 'read',
-          description: 'read a file',
-          parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
-        }]
+        return [
+          {
+            name: 'read',
+            description: 'read a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
+          },
+          {
+            name: 'write',
+            description: 'write a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] },
+          },
+          {
+            name: 'edit',
+            description: 'edit a file',
+            parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] },
+          },
+        ]
       },
       async execute(input) {
         executeCalls.push(input)
@@ -134,7 +146,6 @@ test('HTTP MCP session routing and auth', async (t) => {
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: () => createSessionExecutionScope(fake.service),
   })
   const base = server.url.replace(/\/mcp$/, '')
@@ -170,7 +181,7 @@ test('HTTP MCP session routing and auth', async (t) => {
   // valid session reuse: tools/list with the session id
   const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sessionId })
   assert.equal(list.status, 200)
-  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read'])
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit'])
   assert.equal(executeCalls.length, 0, 'tools/list does not execute')
 
   // the execution scope's agent is forwarded to ctx.tools.execute()
@@ -206,7 +217,6 @@ test('failed initialize disposes the execution scope', async (t) => {
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: () => createSessionExecutionScope(fake.service),
   })
   const base = server.url.replace(/\/mcp$/, '')
@@ -230,7 +240,7 @@ test('failed initialize disposes the execution scope', async (t) => {
     requestInit: { headers: auth },
   }))
   const list = await client.listTools()
-  assert.deepEqual(list.tools.map((x) => x.name), ['read'])
+  assert.deepEqual(list.tools.map((x) => x.name), ['read', 'write', 'edit'])
   // Note: SDK client.close() only aborts the SSE stream — it does not send
   // DELETE (session termination is a separate SDK method). The detach paths
   // are covered by the explicit-DELETE and server-close tests above.
@@ -245,7 +255,6 @@ test('server close disposes all execution scopes', async (t) => {
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: () => createSessionExecutionScope(fake.service),
   })
   const base = server.url.replace(/\/mcp$/, '')
@@ -358,7 +367,6 @@ test('diagnostics: off path skips classify / request diagnostics work', async (t
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: () => createSessionExecutionScope(fake.service),
     log: (m) => lines.push(m),
   })
@@ -380,7 +388,7 @@ test('diagnostics: off path skips classify / request diagnostics work', async (t
 
   const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
   assert.equal(list.status, 200)
-  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read'])
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit'])
 
   const call = await rpc(`${base}/mcp`, {
     jsonrpc: '2.0', id: 3, method: 'tools/call',
@@ -417,7 +425,6 @@ test('diagnostics: enabled via env; request + lifecycle rows, secrets redacted',
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: () => createSessionExecutionScope(fake.service),
     log: (m) => lines.push(m),
   })
@@ -521,7 +528,6 @@ test('diagnostics: enabled via option; MCP behavior unchanged', async (t) => {
     tools,
     token: TOKEN,
     port: 0,
-    allow: ['read'],
     createExecutionScope: () => createSessionExecutionScope(fake.service),
     diagnosticRequests: true,
     log: (m) => lines.push(m),
@@ -537,7 +543,7 @@ test('diagnostics: enabled via option; MCP behavior unchanged', async (t) => {
 
   const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
   assert.equal(list.status, 200)
-  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read'])
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit'])
 
   const call = await rpc(`${base}/mcp`, {
     jsonrpc: '2.0', id: 3, method: 'tools/call',

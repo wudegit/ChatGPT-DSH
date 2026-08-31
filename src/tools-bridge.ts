@@ -1,10 +1,10 @@
 /**
  * ChatGPT-DSH MCP Server Core — DSH Tool Adapter + MCP protocol handlers.
  *
- * Exposes an allowlisted subset of `ctx.tools.schemas()` as MCP tools and
- * forwards `tools/call` to `ctx.tools.execute()`. The harness tool registry
- * is the source of truth; this module is only an adapter. No tool
- * implementation is redefined here.
+ * Exposes a validated ChatGPT-facing profile over `ctx.tools.schemas()` as
+ * MCP tools and forwards `tools/call` to `ctx.tools.execute()`. The harness
+ * tool registry is the schema/execution source of truth; this module is only
+ * an adapter. No tool implementation is redefined here.
  *
  * This module is transport-agnostic: it creates the MCP `Server` and the
  * tools/list + tools/call handlers, and the caller connects whichever
@@ -20,6 +20,7 @@ import type {
   ListToolsResult,
 } from '@modelcontextprotocol/sdk/types.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import type { ProfiledToolSchema } from './tool-profile.ts'
 
 /** Bridge version, reported as the MCP server version. Keep in sync with package.json. */
 export const BRIDGE_VERSION = '0.1.0'
@@ -78,8 +79,8 @@ export interface BridgeToolRuntime {
 
 /** Options for the MCP server core. */
 export interface ToolsServerOptions {
-  /** Tool names exposed over MCP; the default allowlist is empty (expose nothing). */
-  readonly allow?: readonly string[]
+  /** Startup-validated DSH schemas plus ChatGPT-facing profile metadata. */
+  readonly profile: readonly ProfiledToolSchema<BridgeToolSchema>[]
   /**
    * The agent scope for every call handled by this server instance (the DSH
    * execution scope of the owning MCP session). Omitted = agentless calls
@@ -96,17 +97,8 @@ export interface ToolsServer {
   readonly dispose: () => Promise<void>
 }
 
-/** MCP tool definition projected from a DSH tool schema. */
-type McpTool = {
-  readonly name: string
-  readonly description: string
-  readonly inputSchema: {
-    readonly type: 'object'
-    readonly properties?: Record<string, object>
-    readonly required?: string[]
-    readonly [key: string]: unknown
-  }
-}
+/** MCP tool definition projected from a DSH schema plus profile metadata. */
+type McpTool = ListToolsResult['tools'][number]
 
 /** Render one DSH content block as MCP text content; non-text blocks degrade to JSON. */
 function blockToText(block: BridgeContentBlock): string {
@@ -128,14 +120,14 @@ function valueToText(value: unknown): string {
  * Create the MCP server core over the harness tool runtime.
  *
  * @param tools - the harness tool runtime (`ctx.tools`).
- * @param options - allowlist.
+ * @param options - validated exposure profile and optional execution agent.
  * @returns the protocol server (transport not yet connected) and its disposer.
  */
 export function createToolsServer(
   tools: BridgeToolRuntime,
-  options: ToolsServerOptions = {},
+  options: ToolsServerOptions,
 ): ToolsServer {
-  const allow = new Set(options.allow ?? [])
+  const exposedNames = new Set(options.profile.map(entry => entry.schema.name))
 
   const server = new Server(
     { name: 'chatgpt-dsh-mcp-bridge', version: BRIDGE_VERSION },
@@ -143,14 +135,12 @@ export function createToolsServer(
   )
 
   server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResult> => {
-    const toolsList: McpTool[] = tools
-      .schemas()
-      .filter(schema => allow.has(schema.name))
-      .map(schema => ({
-        name: schema.name,
-        description: schema.description,
-        inputSchema: schema.parameters as unknown as McpTool['inputSchema'],
-      }))
+    const toolsList: McpTool[] = options.profile.map(({ schema, annotations }) => ({
+      name: schema.name,
+      description: schema.description,
+      inputSchema: schema.parameters as unknown as McpTool['inputSchema'],
+      annotations,
+    }))
     return { tools: toolsList }
   })
 
@@ -158,7 +148,7 @@ export function createToolsServer(
     CallToolRequestSchema,
     async (request: CallToolRequest): Promise<CallToolResult> => {
       const { name, arguments: args } = request.params
-      if (!allow.has(name)) {
+      if (!exposedNames.has(name)) {
         return {
           content: [{ type: 'text', text: `tool "${name}" is not exposed by this bridge` }],
           isError: true,
