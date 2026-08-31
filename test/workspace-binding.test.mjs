@@ -45,6 +45,16 @@ function mockTools() {
             description: 'edit a file',
             parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] },
           },
+          {
+            name: 'glob',
+            description: 'find files',
+            parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] },
+          },
+          {
+            name: 'grep',
+            description: 'search file contents',
+            parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] },
+          },
         ]
       },
       async execute(input) {

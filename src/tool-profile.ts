@@ -28,7 +28,7 @@ export interface ProfiledToolSchema<TSchema extends NamedToolSchema> {
 }
 
 /**
- * The single static Core Tool Profile exposed to ChatGPT in P2-C2.
+ * The single static Core Tool Profile exposed to ChatGPT in P2-C3.
  *
  * Annotations are MCP client hints only. DSH continues to enforce filesystem
  * policy, sandboxing, and every runtime side effect.
@@ -58,6 +58,24 @@ export const CORE_TOOL_PROFILE = [
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'glob',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'grep',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
       openWorldHint: false,
     },
   },

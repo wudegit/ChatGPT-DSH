@@ -6,7 +6,7 @@ ChatGPT-DSH 是运行在 DeepSeek Harness（DSH）Cordis Runtime 内部的**薄 
 
 > **ChatGPT 是脑子，DSH 是 Runtime 和工具总线，ChatGPT-DSH 只负责把两者接起来。**
 
-> **项目状态：Experimental / P2-C2 已完成。** P0、P1-A、P1-B、P2-0、P2-A、P2-B 第一阶段、P2-C1 审计和 P2-C2 均已完成；P2-A 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机 `read → edit → read-back` 验收。P2-B 第一阶段（Workspace Binding：DSH Host cwd → `SessionHeader.cwd`）已通过目标 workspace 真机 `read → write → read-back → ../ 越界写入拒绝` 验收；P2-C2 已为 `read/write/edit` 建立静态 Core Tool Profile、MCP annotations 与启动时 Registry Contract。动态多 Workspace 仍不在本轮范围。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
+> **项目状态：Experimental / P2-C3 已完成。** P0、P1-A、P1-B、P2-0、P2-A、P2-B 第一阶段、P2-C1 审计、P2-C2 和 P2-C3 均已完成；P2-A 已通过 OpenAI Secure MCP Tunnel + ChatGPT Web 真机 `read → edit → read-back` 验收。P2-B 第一阶段（Workspace Binding：DSH Host cwd → `SessionHeader.cwd`）已通过目标 workspace 真机 `read → write → read-back → ../ 越界写入拒绝` 验收；当前静态 Core Tool Profile 为 `read/write/edit/glob/grep`。动态多 Workspace 仍不在本轮范围。DSH 仍处于快速迭代阶段，后续版本可能需要适配上游 breaking changes。
 
 本项目是独立的社区实验项目，**不是 OpenAI、DeepSeek 或 Model Context Protocol 官方项目，也不代表这些项目的官方立场或支持关系。**
 
@@ -20,7 +20,7 @@ ChatGPT-DSH **不是**：
 - 不是旧 coding-tools MCP 的延续；
 - 不维护独立 workspace / allowed-folder 配置。
 
-## 当前状态：P2-C2（Tool Profile + MCP Metadata + Registry Contract，已完成）
+## 当前状态：P2-C3（Core Read/Search Profile，已完成）
 
 ### P2-A（Stable Bridge Session，已完成，行为保持不变）
 
@@ -132,7 +132,7 @@ DSH Tool Runtime / Sandbox / Policy
 ```
 
 - **DSH Registry 是 runtime 真源**：MCP Tool 的 `name`、`description`、`inputSchema` 仍来自 `ctx.tools.schemas()`，执行仍只调用 `ctx.tools.execute()`；Profile 不复制 DSH description、parameters 或 Tool 实现。
-- **Core Tool Profile 是 exposure contract**：当前且只有 `read`、`write`、`edit`。DSH Registry 中额外出现的 `glob`、`grep`、`pwsh` 或其他 Tool 不会自动暴露。
+- **Core Tool Profile 是 exposure contract**：P2-C2 建立时只有 `read`、`write`、`edit`；P2-C3 在同一个静态 Profile 中加入 `glob/grep`。Profile 外的 `pwsh` 或其他 DSH Tool 不会自动暴露。
 - **启动时 fail closed**：HTTP listener 创建前校验完整 DSH Registry；任何重复 Tool name 都以 `duplicate DSH tool names: ...` 拒绝启动 Bridge，任何 Core Tool 缺失都以 `missing required DSH tools: ...` 拒绝启动 Bridge。失败只影响 MCP Bridge，DSH Web Runtime 保持运行。
 - **annotations 只是客户端提示**：不构成授权、路径检查或安全 enforcement；实际 filesystem、observation policy 与 sandbox 继续由 DSH 执行。
 
@@ -143,6 +143,33 @@ DSH Tool Runtime / Sandbox / Policy
 | `edit` | `false` | `true` | `false` | `false` |
 
 `read.openWorldHint = false` 表示它不与外部世界或外部实体交互；这不代表 workspace read containment。DSH 当前 `read` 仍可读取宿主账号有权访问的绝对本地路径。
+
+### P2-C3（Core Read/Search Profile，已完成）
+
+P2-C3 将当前安装的 `@deepseek-ai/dsh-tool-fs-search@0.1.1-rc.1` 原生 `glob/grep` 纳入同一个静态 Core Tool Profile，稳定顺序为：
+
+```text
+read → write → edit → glob → grep
+```
+
+两者的 `description`、`parameters` 和执行仍全部来自 DSH Registry；ChatGPT-DSH 只增加 exposure 与以下 MCP client hints：
+
+| Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
+|---|---:|---:|---:|---:|
+| `glob` | `true` | `false` | `true` | `false` |
+| `grep` | `true` | `false` | `true` | `false` |
+
+`glob/grep` 是本地 read-only discovery Tool，但**不是 workspace read containment Tool**。当前 DSH 实现不经过 `ctx.fs` / `fs-sandbox`，而是构造固定 packaged ripgrep argv 并调用 `ctx.subprocess.spawn()`：
+
+```text
+dsh-tool-fs-search → packaged ripgrep → ctx.subprocess
+```
+
+- 未给 `path` 时，`SessionHeader.cwd` 是默认 subprocess cwd 和相对路径基准。
+- 显式 absolute/outside `path` 可能读取宿主账号可读的 workspace 外数据；这是当前 DSH capability semantics，不是 `workspace-write` 的搜索隔离承诺，也不由 Bridge 增加第二套路径过滤。
+- 2026-08-31 本机临时目录实测：相对 `glob("src/**/*.ts")` 与 `grep("createToolsServer")` 命中 session workspace；显式指向同级 outside 测试目录的 `glob/grep` 均命中普通标记文件。测试目录随后已删除。
+- DSH 默认保留边界为：`glob` 100 paths、`grep` 250 matches、每条 grep line preview 2000 bytes、raw stdout 20 MB、search timeout 30 秒。超出 inline cap 时可尝试写 session-owned formatted-result spill；这种内部结果保留不改变 search 的 read-only 工具语义。Bridge 不增加第二层 result limit。
+- Bridge 继续向 `ctx.tools.execute()` 传入现有 `AbortSignal`，DSH search 再把 `exec.signal` 传给 subprocess；正式 MCP cancel propagation 与 Bridge timeout policy 仍属于 P2-C6。
 
 ### P1-A 历史（本机 Streamable HTTP MCP 闭环，已并入 P2-A）
 
@@ -176,7 +203,7 @@ DSH Sandbox / Policy
 
   这是执行上下文接线（execution context plumbing），**不是** P2 的 Bridge Session / ChatGPT Conversation 映射；P1-A 时期 session header 不带 cwd，fs/sandbox 以 DSH 启动 cwd 为 workspace（P2-B 第一阶段起已改为写入 Host cwd，见上）。
 
-- **minimal agent 限制**：传给 `ctx.tools.execute()` 的 execution actor 只是 `{ id, session }`。它足够支撑当前 Core Tool Profile（read/write/edit）下的 Tool Policy（observation、sandbox、checkpoint），但**不是完整 DSH Agent**——完整 Agent / Approval / Agent Loop 语义不在 P1-A 承诺范围内。
+- **minimal agent 限制**：传给 `ctx.tools.execute()` 的 execution actor 只是 `{ id, session }`。它足够支撑当前 Core Tool Profile（read/write/edit/glob/grep）所需的 observation、cwd、sandbox 与 search session ownership，但**不是完整 DSH Agent**——完整 Agent / Approval / Agent Loop 语义不在当前承诺范围内。
 
 配置（环境变量）：
 
@@ -385,6 +412,8 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 | `read` | `read` | `file_path` (必填), `offset`, `limit` | 读取 UTF-8 文本文件，返回带行号内容 |
 | `write` | `write` | `file_path` (必填), `content` (必填) | 创建或整体替换文本文件 |
 | `edit` | `edit` | `file_path` (必填), `old_string` (必填), `new_string` (必填) | 字符串替换 |
+| `glob` | `glob` | schema 来自 DSH Registry | 通过 packaged ripgrep 按路径模式发现文件；read-only，但无 workspace read containment |
+| `grep` | `grep` | schema 来自 DSH Registry | 通过 packaged ripgrep 搜索文件内容；read-only，但无 workspace read containment |
 
 ## 映射关系
 
@@ -393,7 +422,7 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 
 ## 已知限制（P1-A / P2-A 实测）
 
-- 每次 `tools/call` 使用独立的 `AbortController`，无超时策略、无 AbortSignal 传播、无审批桥接（按要求不实现）；
+- 每次 `tools/call` 使用独立的 `AbortController` 并把 signal 传给 `ctx.tools.execute()`；当前没有 MCP cancel propagation、Bridge timeout policy 或审批桥接（按要求不实现）；
 - 非 text 的 DSH content block（image/audio 等）以 JSON 文本形式返回；
 - Core Tool Profile 是插件内静态 contract，当前不支持动态 preset、环境变量选择或配置文件 reload；
 - MCP Session 默认 5 分钟无请求后 stale cleanup（`CHATGPT_DSH_MCP_SESSION_IDLE_MS`），即使客户端不发送 MCP DELETE 也会自动关闭并释放其 Bridge lease / fallback scope；插件卸载时统一释放剩余 session；
@@ -411,7 +440,8 @@ curl -i -X POST http://127.0.0.1:3210/mcp -H "Authorization: Bearer wrong-secret
 - ⬜ 动态多 Workspace：ChatGPT 内切换项目 / `workspace_bind` MCP Tool / Bridge Session 独立 workspace / workspace 持久化——不在本轮范围，当前仍是 one DSH Runtime → one Host workspace；
 - ⬜ 正式 Sandbox / Approval 链对接（sandbox-policy / fs-sandbox，默认 workspace-write）；
 - ✅ P2-C2：静态 Core Tool Profile（`read/write/edit`）、Tool Name Collision / required Tool 校验、MCP Tool Annotation；
-- ⬜ 后续 P2-C：`glob/grep/pwsh`、正式 Approval execution context、超时 / Cancel、结果大小限制。
+- ✅ P2-C3：将 DSH 原生 `glob/grep` 纳入静态 Core Read/Search Profile，保留 DSH schema、execution、result bounding 与 outside-read 语义；
+- ⬜ 后续 P2-C：`pwsh`、正式 Approval execution context、超时 / Cancel、Bridge 结果大小限制。
 
 ## 相关项目
 

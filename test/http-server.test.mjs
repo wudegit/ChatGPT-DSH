@@ -42,6 +42,16 @@ function mockTools() {
             description: 'edit a file',
             parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] },
           },
+          {
+            name: 'glob',
+            description: 'find files',
+            parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] },
+          },
+          {
+            name: 'grep',
+            description: 'search file contents',
+            parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] },
+          },
         ]
       },
       async execute(input) {
@@ -181,7 +191,7 @@ test('HTTP MCP session routing and auth', async (t) => {
   // valid session reuse: tools/list with the session id
   const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sessionId })
   assert.equal(list.status, 200)
-  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit'])
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit', 'glob', 'grep'])
   assert.equal(executeCalls.length, 0, 'tools/list does not execute')
 
   // the execution scope's agent is forwarded to ctx.tools.execute()
@@ -240,7 +250,7 @@ test('failed initialize disposes the execution scope', async (t) => {
     requestInit: { headers: auth },
   }))
   const list = await client.listTools()
-  assert.deepEqual(list.tools.map((x) => x.name), ['read', 'write', 'edit'])
+  assert.deepEqual(list.tools.map((x) => x.name), ['read', 'write', 'edit', 'glob', 'grep'])
   // Note: SDK client.close() only aborts the SSE stream — it does not send
   // DELETE (session termination is a separate SDK method). The detach paths
   // are covered by the explicit-DELETE and server-close tests above.
@@ -388,7 +398,7 @@ test('diagnostics: off path skips classify / request diagnostics work', async (t
 
   const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
   assert.equal(list.status, 200)
-  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit'])
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit', 'glob', 'grep'])
 
   const call = await rpc(`${base}/mcp`, {
     jsonrpc: '2.0', id: 3, method: 'tools/call',
@@ -543,7 +553,7 @@ test('diagnostics: enabled via option; MCP behavior unchanged', async (t) => {
 
   const list = await rpc(`${base}/mcp`, toolsList(), { ...auth, 'Mcp-Session-Id': sid })
   assert.equal(list.status, 200)
-  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit'])
+  assert.deepEqual(list.json?.result?.tools?.map((x) => x.name), ['read', 'write', 'edit', 'glob', 'grep'])
 
   const call = await rpc(`${base}/mcp`, {
     jsonrpc: '2.0', id: 3, method: 'tools/call',
